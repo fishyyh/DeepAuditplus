@@ -71,6 +71,7 @@ const LANGUAGES = [
   { value: 'typescript', label: 'TypeScript' },
   { value: 'java', label: 'Java' },
   { value: 'go', label: 'Go' },
+  { value: 'solidity', label: 'Solidity' },
 ];
 
 const RULE_TYPES = [
