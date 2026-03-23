@@ -98,6 +98,7 @@ export default function Projects() {
       'python': 'Python',
       'java': 'Java',
       'go': 'Go',
+      'solidity': 'Solidity',
       'rust': 'Rust',
       'cpp': 'C++',
       'csharp': 'C#',

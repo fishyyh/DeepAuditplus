@@ -370,6 +370,7 @@ export default function ProjectDetail() {
       'python': 'Python',
       'java': 'Java',
       'go': 'Go',
+      'solidity': 'Solidity',
       'rust': 'Rust',
       'cpp': 'C++',
       'csharp': 'C#',
