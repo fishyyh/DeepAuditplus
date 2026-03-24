@@ -1131,6 +1131,8 @@ class BaseAgent(ABC):
                 "npm_audit": 90,
                 "safety_scan": 60,
                 "kunlun_scan": 180,
+                "slither_scan": 300,
+                "mythril_scan": 420,
                 "osv_scanner": 60,
                 "trufflehog_scan": 90,
                 "sandbox_exec": 60,

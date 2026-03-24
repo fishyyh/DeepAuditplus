@@ -731,6 +731,7 @@ async def _initialize_tools(
         PatternMatchTool, CodeAnalysisTool, DataFlowAnalysisTool,
         SemgrepTool, BanditTool, GitleaksTool,
         NpmAuditTool, SafetyTool, TruffleHogTool, OSVScannerTool,  # 🔥 Added missing tools
+        SlitherTool, MythrilTool,
         KunlunMTool, KunlunRuleListTool,
         ThinkTool, ReflectTool,
         CreateVulnerabilityReportTool,
@@ -930,6 +931,8 @@ async def _initialize_tools(
         "gitleaks_scan": GitleaksTool(project_root, sandbox_manager),
         "kunlun_scan": KunlunMTool(project_root),
         "kunlun_list_rules": KunlunRuleListTool(project_root),
+        "slither_scan": SlitherTool(project_root, sandbox_manager),
+        "mythril_scan": MythrilTool(project_root, sandbox_manager),
         "npm_audit": NpmAuditTool(project_root, sandbox_manager),
         "safety_scan": SafetyTool(project_root, sandbox_manager),
         "trufflehog_scan": TruffleHogTool(project_root, sandbox_manager),
@@ -960,6 +963,8 @@ async def _initialize_tools(
         "gitleaks_scan": GitleaksTool(project_root, sandbox_manager),
         "kunlun_scan": KunlunMTool(project_root),
         "kunlun_list_rules": KunlunRuleListTool(project_root),
+        "slither_scan": SlitherTool(project_root, sandbox_manager),
+        "mythril_scan": MythrilTool(project_root, sandbox_manager),
         "npm_audit": NpmAuditTool(project_root, sandbox_manager),
         "safety_scan": SafetyTool(project_root, sandbox_manager),
         "trufflehog_scan": TruffleHogTool(project_root, sandbox_manager),
@@ -1272,44 +1277,80 @@ async def _save_findings(
             if "logic" in raw_type or "timestamp" in raw_type or "random" in raw_type:
                 type_enum = VulnerabilityType.BUSINESS_LOGIC
 
-            # 🔥 Handle file path (support multiple field names)
-            file_path = (
-                finding.get("file_path") or
-                finding.get("file") or
-                finding.get("location", "").split(":")[0] if ":" in finding.get("location", "") else finding.get("location")
+            # 🔥 统一提取路径和行号：支持 file/location/title 混合格式
+            location_text = str(finding.get("location") or "")
+            title_text = str(finding.get("title") or "")
+            raw_file_path = finding.get("file_path") or finding.get("file")
+
+            loc_path, loc_line_start, loc_line_end = _parse_path_and_lines(location_text)
+            title_path, title_line_start, title_line_end = _parse_path_and_lines(title_text)
+
+            file_path = _normalize_file_path(raw_file_path) or loc_path or title_path
+
+            line_start = (
+                _parse_positive_int(finding.get("line_start")) or
+                _parse_positive_int(finding.get("line")) or
+                _parse_positive_int(finding.get("line_number")) or
+                loc_line_start or
+                title_line_start
             )
+            line_end = (
+                _parse_positive_int(finding.get("line_end")) or
+                loc_line_end or
+                title_line_end or
+                line_start
+            )
+            if line_end and line_start and line_end < line_start:
+                line_end = line_start
 
-            # 🔥 v2.1: 文件路径验证 - 过滤幻觉发现
-            if project_root and file_path:
-                # 清理路径（移除可能的行号）
-                clean_path = file_path.split(":")[0].strip() if ":" in file_path else file_path.strip()
-                full_path = os.path.join(project_root, clean_path)
-
-                if not os.path.isfile(full_path):
-                    # 尝试作为绝对路径
-                    if not (os.path.isabs(clean_path) and os.path.isfile(clean_path)):
-                        logger.warning(
-                            f"[SaveFindings] 🚫 跳过幻觉发现: 文件不存在 '{file_path}' "
-                            f"(title: {finding.get('title', 'N/A')[:50]})"
-                        )
-                        continue  # 跳过这个发现
-
-            # 🔥 Handle line numbers (support multiple formats)
-            line_start = finding.get("line_start") or finding.get("line")
-            if not line_start and ":" in finding.get("location", ""):
-                try:
-                    line_start = int(finding.get("location", "").split(":")[1])
-                except (ValueError, IndexError):
-                    line_start = None
-
-            line_end = finding.get("line_end") or line_start
-
-            # 🔥 Handle code snippet (support multiple field names)
-            code_snippet = (
+            # 🔥 Handle code snippet (support multiple field names) + 清洗
+            code_snippet = _sanitize_code_snippet(
                 finding.get("code_snippet") or
                 finding.get("code") or
                 finding.get("vulnerable_code")
             )
+
+            # 🔥 文件路径与代码片段补全：保证每条漏洞都能定位到具体代码
+            resolved_full_path = None
+            manual_locate_reasons: List[str] = []
+            if project_root and file_path:
+                resolved_full_path = _resolve_file_in_workspace(project_root, file_path)
+                if not resolved_full_path:
+                    logger.warning(
+                        f"[SaveFindings] ⚠️ 无法自动定位文件，标记待人工定位: '{file_path}' "
+                        f"(title: {finding.get('title', 'N/A')[:50]})"
+                    )
+                    manual_locate_reasons.append(f"文件路径无法在项目中定位: {file_path}")
+
+            if resolved_full_path and code_snippet and not line_start:
+                inferred_line = _locate_snippet_start_line(resolved_full_path, code_snippet)
+                if inferred_line:
+                    line_start = inferred_line
+                    line_end = line_end or inferred_line
+
+            if resolved_full_path and not code_snippet:
+                snippet, inferred_start, inferred_end = _extract_snippet_with_context(
+                    resolved_full_path,
+                    line_start,
+                    line_end,
+                )
+                code_snippet = _sanitize_code_snippet(snippet)
+                if not line_start:
+                    line_start = inferred_start
+                if not line_end:
+                    line_end = inferred_end
+
+            if not file_path:
+                logger.warning(
+                    f"[SaveFindings] ⚠️ 缺少文件路径，标记待人工定位: {finding.get('title', 'N/A')[:80]}"
+                )
+                manual_locate_reasons.append("缺少漏洞文件路径")
+
+            if not code_snippet:
+                logger.warning(
+                    f"[SaveFindings] ⚠️ 缺少漏洞代码片段，标记待人工定位: {finding.get('title', 'N/A')[:80]} ({file_path})"
+                )
+                manual_locate_reasons.append("缺少漏洞代码片段")
 
             # 🔥 Handle title (generate from type if not provided)
             title = finding.get("title")
@@ -1337,6 +1378,12 @@ async def _save_findings(
                 finding.get("remediation") or
                 finding.get("fix")
             )
+            if manual_locate_reasons:
+                locate_note = "待人工定位: " + "；".join(manual_locate_reasons)
+                if suggestion:
+                    suggestion = f"{suggestion}\n\n{locate_note}"
+                else:
+                    suggestion = locate_note
 
             # 🔥 Handle confidence (map to ai_confidence field in model)
             confidence = finding.get("confidence") or finding.get("ai_confidence") or 0.5
@@ -1350,6 +1397,9 @@ async def _save_findings(
             is_verified = finding.get("is_verified", False)
             if finding.get("verdict") == "confirmed":
                 is_verified = True
+            if manual_locate_reasons:
+                # 缺少关键定位信息时，不应视为已验证
+                is_verified = False
 
             # 🔥 Handle PoC information
             poc_data = finding.get("poc", {})
@@ -1370,6 +1420,11 @@ async def _save_findings(
             verification_result = None
             if finding.get("verification_details"):
                 verification_result = {"details": finding.get("verification_details")}
+            if manual_locate_reasons:
+                verification_method = verification_method or "manual_locate_required"
+                if verification_result is None:
+                    verification_result = {}
+                verification_result["manual_locate_reasons"] = manual_locate_reasons
 
             # 🔥 Handle CWE and CVSS
             cwe_id = finding.get("cwe_id") or finding.get("cwe")
@@ -1379,6 +1434,15 @@ async def _save_findings(
                     cvss_score = float(cvss_score)
                 except ValueError:
                     cvss_score = None
+
+            finding_metadata = {
+                "manual_locate_required": bool(manual_locate_reasons),
+                "manual_locate_reasons": manual_locate_reasons,
+            }
+            if location_text:
+                finding_metadata["raw_location"] = location_text[:500]
+            if title_text:
+                finding_metadata["raw_title"] = title_text[:500]
 
             db_finding = AgentFinding(
                 id=str(uuid4()),
@@ -1394,7 +1458,7 @@ async def _save_findings(
                 suggestion=suggestion[:5000] if suggestion else None,
                 is_verified=is_verified,
                 ai_confidence=confidence,  # 🔥 FIX: Use ai_confidence, not confidence
-                status=FindingStatus.VERIFIED if is_verified else FindingStatus.NEW,
+                status=FindingStatus.NEEDS_REVIEW if manual_locate_reasons else (FindingStatus.VERIFIED if is_verified else FindingStatus.NEW),
                 # 🔥 Additional fields
                 has_poc=has_poc,
                 poc_code=poc_code,
@@ -1403,6 +1467,7 @@ async def _save_findings(
                 verification_method=verification_method,
                 verification_result=verification_result,
                 cvss_score=cvss_score,
+                finding_metadata=finding_metadata,
                 # References for CWE
                 references=[{"cwe": cwe_id}] if cwe_id else None,
             )
@@ -2261,6 +2326,158 @@ async def update_finding_status(
 
 
 # ============ Helper Functions ============
+
+def _parse_positive_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        v = value.strip()
+        if v.isdigit():
+            num = int(v)
+            return num if num > 0 else None
+    return None
+
+
+def _parse_path_and_lines(text: Optional[str]) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    """从文本中解析 file:line 或 file:line-line_end"""
+    if not text:
+        return None, None, None
+
+    cleaned = str(text).replace("`", " ").strip()
+    match = re.search(r'([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+):(\d+)(?:-(\d+))?', cleaned)
+    if not match:
+        return None, None, None
+
+    parsed_path = match.group(1).replace("\\", "/").strip().lstrip("./")
+    line_start = _parse_positive_int(match.group(2))
+    line_end = _parse_positive_int(match.group(3)) if match.group(3) else None
+    if line_end and line_start and line_end < line_start:
+        line_end = line_start
+
+    return parsed_path or None, line_start, line_end
+
+
+def _normalize_file_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    value = str(path).strip().strip("`'\"").replace("\\", "/")
+    parsed_path, _, _ = _parse_path_and_lines(value)
+    if parsed_path:
+        value = parsed_path
+    value = value.strip().lstrip("./")
+    return value or None
+
+
+def _sanitize_code_snippet(snippet: Any) -> Optional[str]:
+    if snippet is None:
+        return None
+
+    text = str(snippet).strip()
+    if not text:
+        return None
+
+    text = re.sub(r'^```[a-zA-Z0-9_+\-]*\s*\n', '', text)
+    text = re.sub(r'\n```$', '', text)
+    text = text.strip()
+
+    empty_markers = {"n/a", "na", "none", "null", "无", "未知", "-"}
+    if text.lower() in empty_markers:
+        return None
+
+    return text
+
+
+def _resolve_file_in_workspace(workspace_root: str, file_path: Optional[str]) -> Optional[str]:
+    if not workspace_root or not file_path:
+        return None
+
+    normalized_path = _normalize_file_path(file_path)
+    if not normalized_path:
+        return None
+
+    if os.path.isabs(normalized_path) and os.path.isfile(normalized_path):
+        return normalized_path
+
+    root_real = os.path.realpath(workspace_root)
+    candidate = os.path.realpath(os.path.join(workspace_root, normalized_path))
+    if candidate.startswith(root_real) and os.path.isfile(candidate):
+        return candidate
+
+    return None
+
+
+def _locate_snippet_start_line(abs_path: str, snippet: Optional[str]) -> Optional[int]:
+    if not abs_path or not snippet:
+        return None
+
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            file_lines = f.readlines()
+    except Exception:
+        return None
+
+    anchor = None
+    for line in str(snippet).splitlines():
+        candidate = line.strip()
+        if candidate:
+            anchor = candidate[:120]
+            break
+
+    if not anchor:
+        return None
+
+    for idx, line in enumerate(file_lines, 1):
+        if anchor in line:
+            return idx
+
+    return None
+
+
+def _extract_snippet_with_context(
+    abs_path: str,
+    line_start: Optional[int],
+    line_end: Optional[int],
+    context: int = 6,
+    max_lines: int = 80,
+) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    if not abs_path:
+        return None, line_start, line_end
+
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return None, line_start, line_end
+
+    total = len(lines)
+    if total == 0:
+        return None, line_start, line_end
+
+    start = line_start if isinstance(line_start, int) and line_start > 0 else None
+    end = line_end if isinstance(line_end, int) and line_end > 0 else None
+
+    if start:
+        window_start = max(1, start - context)
+        if end and end >= start:
+            window_end = min(total, end + context)
+        else:
+            window_end = min(total, start + context)
+    else:
+        window_start = 1
+        window_end = min(total, max_lines)
+
+    if window_end < window_start:
+        window_end = window_start
+    if window_end - window_start + 1 > max_lines:
+        window_end = window_start + max_lines - 1
+
+    snippet = "".join(lines[window_start - 1:window_end]).strip("\n")
+    if not snippet.strip():
+        return None, start, end
+
+    return snippet, (start or window_start), (end or (start or window_end))
 
 def validate_git_url(url: str) -> bool:
     """
@@ -3238,6 +3455,63 @@ async def generate_audit_report(
     # 🔥 Helper function to normalize severity for comparison (case-insensitive)
     def normalize_severity(sev: str) -> str:
         return str(sev).lower().strip() if sev else ""
+
+    # 报告兜底：尽可能补齐历史数据里的 file_path / line / code_snippet
+    workspace_roots: List[str] = []
+    base_workspace = os.path.join("/tmp/deepaudit", task_id)
+    if os.path.isdir(base_workspace):
+        workspace_roots.append(base_workspace)
+        try:
+            real_items = [
+                item for item in os.listdir(base_workspace)
+                if not item.startswith("__") and not item.startswith(".")
+            ]
+            if len(real_items) == 1:
+                nested = os.path.join(base_workspace, real_items[0])
+                if os.path.isdir(nested):
+                    workspace_roots.append(nested)
+        except Exception:
+            pass
+
+    def _enrich_finding_for_report(finding: AgentFinding) -> Dict[str, Any]:
+        parsed_from_title_path, parsed_from_title_start, parsed_from_title_end = _parse_path_and_lines(finding.title or "")
+
+        report_file_path = _normalize_file_path(finding.file_path) or parsed_from_title_path
+        report_line_start = finding.line_start or parsed_from_title_start
+        report_line_end = finding.line_end or parsed_from_title_end or report_line_start
+        report_code_snippet = _sanitize_code_snippet(finding.code_snippet)
+
+        resolved_path = None
+        if report_file_path:
+            for root in workspace_roots:
+                resolved_path = _resolve_file_in_workspace(root, report_file_path)
+                if resolved_path:
+                    break
+
+        if resolved_path and report_code_snippet and not report_line_start:
+            inferred_start = _locate_snippet_start_line(resolved_path, report_code_snippet)
+            if inferred_start:
+                report_line_start = inferred_start
+                report_line_end = report_line_end or inferred_start
+
+        if resolved_path and not report_code_snippet:
+            snippet, inferred_start, inferred_end = _extract_snippet_with_context(
+                resolved_path,
+                report_line_start,
+                report_line_end,
+            )
+            report_code_snippet = _sanitize_code_snippet(snippet)
+            if not report_line_start:
+                report_line_start = inferred_start
+            if not report_line_end:
+                report_line_end = inferred_end
+
+        return {
+            "file_path": report_file_path,
+            "line_start": report_line_start,
+            "line_end": report_line_end,
+            "code_snippet": report_code_snippet,
+        }
     
     # Log findings for debugging
     logger.info(f"[Report] Task {task_id}: Found {len(findings)} findings from database")
@@ -3275,15 +3549,13 @@ async def generate_audit_report(
             },
             "findings": [
                 {
+                    **_enrich_finding_for_report(f),
                     "id": f.id,
                     "title": f.title,
                     "severity": f.severity,
                     "vulnerability_type": f.vulnerability_type,
                     "description": f.description,
-                    "file_path": f.file_path,
-                    "line_start": f.line_start,
-                    "line_end": f.line_end,
-                    "code_snippet": f.code_snippet,
+                    "status": f.status,
                     "is_verified": f.is_verified,
                     "has_poc": f.has_poc,
                     "poc_code": f.poc_code,
@@ -3292,6 +3564,7 @@ async def generate_audit_report(
                     "confidence": f.ai_confidence,
                     "suggestion": f.suggestion,
                     "fix_code": f.fix_code,
+                    "finding_metadata": f.finding_metadata,
                     "created_at": f.created_at.isoformat() if f.created_at else None,
                 } for f in findings
             ]
@@ -3412,6 +3685,12 @@ async def generate_audit_report(
             md_lines.append("")
 
             for i, f in enumerate(severity_findings, 1):
+                enriched = _enrich_finding_for_report(f)
+                report_file_path = enriched["file_path"]
+                report_line_start = enriched["line_start"]
+                report_line_end = enriched["line_end"]
+                report_code_snippet = enriched["code_snippet"]
+
                 verified_badge = "[已验证]" if f.is_verified else "[未验证]"
                 poc_badge = " [含 PoC]" if f.has_poc else ""
 
@@ -3420,12 +3699,16 @@ async def generate_audit_report(
                 md_lines.append(f"**{verified_badge}**{poc_badge} | 类型: `{f.vulnerability_type}`")
                 md_lines.append("")
 
-                if f.file_path:
-                    location = f"`{f.file_path}"
-                    if f.line_start:
-                        location += f":{f.line_start}"
-                        if f.line_end and f.line_end != f.line_start:
-                            location += f"-{f.line_end}"
+                if str(f.status or "").lower() == FindingStatus.NEEDS_REVIEW:
+                    md_lines.append("**状态:** 待人工定位（缺少可自动定位的文件路径或代码片段）")
+                    md_lines.append("")
+
+                if report_file_path:
+                    location = f"`{report_file_path}"
+                    if report_line_start:
+                        location += f":{report_line_start}"
+                        if report_line_end and report_line_end != report_line_start:
+                            location += f"-{report_line_end}"
                     location += "`"
                     md_lines.append(f"**位置:** {location}")
                     md_lines.append("")
@@ -3440,11 +3723,11 @@ async def generate_audit_report(
                     md_lines.append(f.description)
                     md_lines.append("")
 
-                if f.code_snippet:
+                lang = "text"
+                if report_code_snippet:
                     # 🔥 v2.1: 增强语言检测，避免默认 python 标记错误
-                    lang = "text"  # 默认使用 text 而非 python
-                    if f.file_path:
-                        ext = f.file_path.split('.')[-1].lower()
+                    if report_file_path:
+                        ext = report_file_path.split('.')[-1].lower()
                         lang_map = {
                             # Python
                             'py': 'python', 'pyw': 'python', 'pyi': 'python',
@@ -3493,7 +3776,7 @@ async def generate_audit_report(
                     md_lines.append("**漏洞代码:**")
                     md_lines.append("")
                     md_lines.append(f"```{lang}")
-                    md_lines.append(f.code_snippet.strip())
+                    md_lines.append(report_code_snippet.strip())
                     md_lines.append("```")
                     md_lines.append("")
 
@@ -3506,7 +3789,7 @@ async def generate_audit_report(
                 if f.fix_code:
                     md_lines.append("**参考修复代码:**")
                     md_lines.append("")
-                    md_lines.append(f"```{lang if f.file_path else 'text'}")
+                    md_lines.append(f"```{lang if report_file_path else 'text'}")
                     md_lines.append(f.fix_code.strip())
                     md_lines.append("```")
                     md_lines.append("")

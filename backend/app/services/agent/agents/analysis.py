@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 
 from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, TaskHandoff
@@ -68,6 +68,14 @@ ANALYSIS_SYSTEM_PROMPT = """你是 DeepAudit 的漏洞分析 Agent，一个**自
   参数: target_path (str), language (str: "php"|"javascript"|"solidity")
   示例: {"target_path": ".", "language": "solidity"}
 
+- **slither_scan**: Solidity 主力静态分析（推荐主扫描器）
+  参数: target_path (str), detectors (str, 可选)
+  示例: {"target_path": ".", "detectors": "reentrancy-eth,tx-origin"}
+
+- **mythril_scan**: Solidity 符号执行补充扫描
+  参数: target_path (str), execution_timeout (int), max_files (int)
+  示例: {"target_path": ".", "execution_timeout": 90, "max_files": 8}
+
 ### 第二优先级：智能扫描工具 ⭐⭐
 - **smart_scan**: 智能批量安全扫描
   参数: target (str), quick_mode (bool), focus_vulnerabilities (list)
@@ -85,7 +93,7 @@ ANALYSIS_SYSTEM_PROMPT = """你是 DeepAudit 的漏洞分析 Agent，一个**自
 - **dataflow_analysis**: 数据流追踪
   参数: source_code (str), variable_name (str)
 
-### 辅助工具（RAG 优先！）
+### 辅助工具（RAG 优先，401 自动降级）
 - **rag_query**: **🔥 首选** 语义搜索代码，理解业务逻辑
   参数: query (str), top_k (int)
 - **security_search**: **🔥 首选** 安全相关搜索
@@ -93,7 +101,7 @@ ANALYSIS_SYSTEM_PROMPT = """你是 DeepAudit 的漏洞分析 Agent，一个**自
 - **read_file**: 读取文件内容
   参数: file_path (str), start_line (int), end_line (int)
 - **list_files**: ⚠️ 仅列出目录，严禁遍历
-- **search_code**: ⚠️ 仅查找常量，严禁通用搜索
+- **search_code**: ⚠️ RAG 返回 401/Unauthorized 时的首选降级工具，用精确关键字定位函数/危险调用
 
 ## 📋 推荐分析流程（严格按此执行！）
 
@@ -118,6 +126,17 @@ Action Input: {"requirements_file": "requirements.txt"}
 # Node.js 项目必做
 Action: npm_audit
 Action Input: {"target_path": "."}
+
+# Solidity 深度扫描（优先并行）
+Action: slither_scan
+Action Input: {"target_path": "."}
+
+Action: mythril_scan
+Action Input: {"target_path": ".", "execution_timeout": 90, "max_files": 8}
+
+# Solidity/JS 补充扫描（与 npm_audit 并行）
+Action: kunlun_scan
+Action Input: {"target_path": ".", "language": "solidity"}
 ```
 
 ### 第二步：分析外部工具结果（25%时间）
@@ -137,7 +156,8 @@ Action Input: {"target_path": "."}
 ## ⚠️ 重要提醒
 1. **不要跳过外部工具！** 即使内置工具可能更快，外部工具的检测能力更强
 2. **Docker依赖**：外部工具需要Docker环境，如果返回"Docker不可用"，再使用内置工具
-3. **并行执行**：可以连续调用多个外部工具
+3. **并行执行**：优先并行覆盖 `slither_scan + mythril_scan`，其次 `kunlun_scan + npm_audit`
+4. **RAG 401 降级**：若 `rag_query/security_search/function_context` 返回 401/Unauthorized，立即切换 `search_code + read_file`
 
 ## 工作方式
 每一步，你需要输出：
@@ -381,6 +401,118 @@ class AnalysisAgent(BaseAgent):
                 step.thought = response.strip()[:500]
 
         return step
+
+    @staticmethod
+    def _is_rag_auth_failure(tool_name: str, observation: str) -> bool:
+        """判断是否是 RAG 认证失败（401）"""
+        if tool_name not in {"rag_query", "security_search", "function_context"}:
+            return False
+
+        obs = (observation or "").lower()
+        rag_auth_markers = (
+            "401",
+            "unauthorized",
+            "authentication failed",
+            "invalid_api_key",
+            "incorrect api key",
+            "api 认证失败",
+            "认证失败",
+            "access denied",
+        )
+        return any(marker in obs for marker in rag_auth_markers)
+
+    @staticmethod
+    def _build_search_code_fallback_hint() -> str:
+        """RAG 401 时引导 LLM 改用 search_code 精确定位"""
+        return (
+            "⚠️ 系统提示: 检测到 RAG 工具认证失败（401/Unauthorized）。\n"
+            "请立即切换到 search_code 精确检索流程，并使用 read_file 验证上下文：\n"
+            "1. 先用 search_code 精确查函数/危险调用（不要泛搜）\n"
+            "2. Solidity 优先关键词: delegatecall, tx.origin, selfdestruct, call{value:\n"
+            "3. JavaScript 优先关键词: child_process.exec, eval(, innerHTML, jwt.verify\n"
+            "4. 查询示例: {\"keyword\":\"delegatecall\",\"file_pattern\":\"*.sol\"} / "
+            "{\"keyword\":\"child_process.exec\",\"file_pattern\":\"*.js\"}\n"
+            "5. 命中后立即 read_file 读取函数上下文，再继续漏洞判断"
+        )
+
+    @staticmethod
+    def _infer_kunlun_language(tech_stack: Dict[str, Any]) -> str:
+        """根据技术栈推断 Kunlun-M 的语言参数"""
+        languages = tech_stack.get("languages", []) if isinstance(tech_stack, dict) else []
+        lang_text = " ".join(str(lang).lower() for lang in languages)
+
+        if "solidity" in lang_text:
+            return "solidity"
+        if "php" in lang_text:
+            return "php"
+        return "javascript"
+
+    def _build_parallel_scan_inputs(
+        self,
+        primary_action: str,
+        primary_input: Dict[str, Any],
+        tech_stack: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        """构建优先并行扫描输入参数（slither/mythril/kunlun/npm）"""
+        npm_input: Dict[str, Any] = {"target_path": "."}
+        kunlun_input: Dict[str, Any] = {
+            "target_path": ".",
+            "language": self._infer_kunlun_language(tech_stack),
+        }
+        slither_input: Dict[str, Any] = {"target_path": "."}
+        mythril_input: Dict[str, Any] = {
+            "target_path": ".",
+            "execution_timeout": 90,
+            "max_files": 8,
+        }
+
+        if primary_action == "npm_audit":
+            npm_input.update(primary_input or {})
+        elif primary_action == "kunlun_scan":
+            kunlun_input.update(primary_input or {})
+        elif primary_action == "slither_scan":
+            slither_input.update(primary_input or {})
+        elif primary_action == "mythril_scan":
+            mythril_input.update(primary_input or {})
+
+        if not kunlun_input.get("language"):
+            kunlun_input["language"] = self._infer_kunlun_language(tech_stack)
+
+        return {
+            "npm_audit": npm_input,
+            "kunlun_scan": kunlun_input,
+            "slither_scan": slither_input,
+            "mythril_scan": mythril_input,
+        }
+
+    async def _execute_parallel_priority_scans(
+        self,
+        primary_action: str,
+        primary_input: Dict[str, Any],
+        tech_stack: Dict[str, Any],
+        scan_group: Set[str],
+    ) -> str:
+        """并行执行指定优先扫描组"""
+        scan_inputs = self._build_parallel_scan_inputs(primary_action, primary_input, tech_stack)
+
+        preferred_order = ["slither_scan", "mythril_scan", "kunlun_scan", "npm_audit"]
+        ordered_actions = [action for action in preferred_order if action in scan_group and action in self.tools]
+
+        tasks = [self.execute_tool(action, scan_inputs[action]) for action in ordered_actions]
+        outputs = await asyncio.gather(*tasks)
+
+        group_name = " + ".join(ordered_actions)
+        sections = [f"🚀 已并行执行关键外部扫描: {group_name}"]
+        for action in ordered_actions:
+            sections.append(f"{action} 输入: {json.dumps(scan_inputs[action], ensure_ascii=False)}")
+
+        sections.append("")
+        for action, output in zip(ordered_actions, outputs):
+            sections.append(f"=== {action} 结果 ===")
+            sections.append(str(output))
+            sections.append("")
+
+        return "\n".join(sections).strip()
     
 
     
@@ -487,6 +619,13 @@ class AnalysisAgent(BaseAgent):
         self._steps = []
         all_findings = []
         error_message = None  # 🔥 跟踪错误信息
+        completed_priority_scans: Set[str] = set()
+        available_tool_names = set(self.tools.keys())
+        parallel_priority_groups: List[Set[str]] = []
+        if {"slither_scan", "mythril_scan"}.issubset(available_tool_names):
+            parallel_priority_groups.append({"slither_scan", "mythril_scan"})
+        if {"kunlun_scan", "npm_audit"}.issubset(available_tool_names):
+            parallel_priority_groups.append({"kunlun_scan", "npm_audit"})
         
         await self.emit_thinking("🔬 Analysis Agent 启动，LLM 开始自主安全分析...")
         
@@ -610,10 +749,25 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     if not hasattr(self, '_failed_tool_calls'):
                         self._failed_tool_calls = {}
                     
-                    observation = await self.execute_tool(
-                        step.action,
-                        step.action_input or {}
-                    )
+                    action_input = step.action_input or {}
+                    pending_group: Optional[Set[str]] = None
+                    for group in parallel_priority_groups:
+                        if step.action in group and not group.issubset(completed_priority_scans):
+                            pending_group = group
+                            break
+
+                    if pending_group:
+                        observation = await self._execute_parallel_priority_scans(
+                            step.action,
+                            action_input,
+                            tech_stack,
+                            pending_group,
+                        )
+                        completed_priority_scans.update(pending_group)
+                    else:
+                        observation = await self.execute_tool(step.action, action_input)
+                        if any(step.action in group for group in parallel_priority_groups):
+                            completed_priority_scans.add(step.action)
                     
                     # 🔥 检测工具调用失败并追踪
                     is_tool_error = (
@@ -643,6 +797,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                         # 成功调用，重置失败计数
                         if tool_call_key in self._failed_tool_calls:
                             del self._failed_tool_calls[tool_call_key]
+
+                    rag_auth_failed = self._is_rag_auth_failure(step.action, observation)
+                    if rag_auth_failed:
+                        logger.warning(f"[{self.name}] RAG auth failure detected, forcing search_code fallback")
+                        observation += "\n\n" + self._build_search_code_fallback_hint()
                     
                     # 🔥 工具执行后检查取消状态
                     if self.is_cancelled:
@@ -659,6 +818,11 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                         "role": "user",
                         "content": f"Observation:\n{observation}",
                     })
+                    if rag_auth_failed:
+                        self._conversation_history.append({
+                            "role": "user",
+                            "content": "请立即执行 search_code 精确搜索关键函数（含 file_pattern），随后用 read_file 验证具体代码上下文。",
+                        })
                 else:
                     # LLM 没有选择工具，提示它继续
                     await self.emit_llm_decision("继续分析", "LLM 需要更多分析")

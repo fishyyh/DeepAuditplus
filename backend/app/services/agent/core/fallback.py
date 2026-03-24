@@ -57,6 +57,8 @@ class FallbackConfig:
         "semgrep_scan": "pattern_match",
         "bandit_scan": "pattern_match",
         "kunlun_scan": "pattern_match",
+        "slither_scan": "pattern_match",
+        "mythril_scan": "pattern_match",
         "gitleaks_scan": "search_code",
         "npm_audit": "search_code",
     })

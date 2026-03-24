@@ -175,6 +175,8 @@ TOOL_USAGE_GUIDE = """
 | `bandit_scan` | Python安全扫描 | Python项目**必用**，检测注入/反序列化等 |
 | `gitleaks_scan` | 密钥泄露检测 | **每次分析必用**，检测150+种密钥类型 |
 | `kunlun_scan` | 深度代码审计 | 大型项目推荐，支持 PHP/JavaScript/Solidity 扫描 |
+| `slither_scan` | Solidity 主力扫描 | 智能合约项目**推荐必用**，高质量静态分析 |
+| `mythril_scan` | Solidity 符号执行 | 智能合约项目补充验证，发现可利用路径 |
 | `npm_audit` | Node.js依赖漏洞 | package.json项目**必用** |
 | `safety_scan` | Python依赖漏洞 | requirements.txt项目**必用** |
 | `osv_scan` | 开源漏洞扫描 | 多语言依赖检查 |
@@ -201,7 +203,7 @@ TOOL_USAGE_GUIDE = """
 | `function_context` | **🔥 理解代码结构** - 获取函数调用关系和定义 |
 | `read_file` | 读取文件内容验证发现 |
 | `list_files` | ⚠️ **仅用于** 了解根目录结构，**严禁** 用于遍历代码查找内容 |
-| `search_code` | ⚠️ **仅用于** 查找非常具体的字符串常量，**严禁** 作为主要代码搜索手段 |
+| `search_code` | ⚠️ 精确关键词搜索；当 RAG 返回 401/Unauthorized 时，作为主降级方案 |
 | `query_security_knowledge` | 查询安全知识库 |
 
 ### 🔍 代码搜索工具对比
@@ -210,7 +212,7 @@ TOOL_USAGE_GUIDE = """
 | `rag_query` | **🔥 语义搜索**，理解代码含义 | **首选！** 查找"处理用户输入的函数"、"数据库查询逻辑" |
 | `security_search` | **🔥 安全专用搜索** | **首选！** 查找"SQL注入相关代码"、"认证授权代码" |
 | `function_context` | **🔥 函数上下文** | 查找某函数的调用者和被调用者 |
-| `search_code` | **❌ 关键词搜索**，仅精确匹配 | **不推荐**，仅用于查找确定的常量或变量名 |
+| `search_code` | **关键词搜索**，仅精确匹配 | **RAG 失败时必用**，用于精准定位关键函数/危险调用 |
 
 **❌ 严禁行为**：
 1. **不要** 使用 `list_files` 递归列出所有文件来查找代码
@@ -220,6 +222,7 @@ TOOL_USAGE_GUIDE = """
 1. **始终优先使用 RAG 工具** (`rag_query`, `security_search`)
 2. `rag_query` 可以理解自然语言，如 "Show me the login function"
 3. 仅在确实需要精确匹配特定字符串时才使用 `search_code`
+4. 若 `rag_query/security_search/function_context` 返回 401 或 Unauthorized，立即切换 `search_code + read_file`
 
 ### 📋 推荐分析流程
 
@@ -235,6 +238,11 @@ Action Input: {"directory": ".", "max_depth": 2}
 ```
 Action: rag_query
 Action Input: {"query": "用户的登录认证逻辑在哪里？", "top_k": 5}
+```
+如果 RAG 出现认证失败（401）：
+```
+Action: search_code
+Action Input: {"keyword": "jwt.verify", "file_pattern": "*.js", "max_results": 30}
 ```
 
 #### 第二步：外部工具全面扫描（60%时间）⚡重点！
@@ -259,9 +267,16 @@ Action Input: {"requirements_file": "requirements.txt"}
 Action: npm_audit
 Action Input: {"target_path": "."}
 
-# 大型项目（推荐）
+# Solidity 项目（推荐，优先并行）
+Action: slither_scan
+Action Input: {"target_path": "."}
+
+Action: mythril_scan
+Action Input: {"target_path": ".", "execution_timeout": 90, "max_files": 8}
+
+# Solidity/JS 项目补充（推荐，与 npm_audit 并行）
 Action: kunlun_scan
-Action Input: {"target_path": ".", "rules": "all"}
+Action Input: {"target_path": ".", "language": "solidity"}
 ```
 
 #### 第三步：深度分析（25%时间）

@@ -276,7 +276,8 @@ class ExternalToolInput(ToolInput):
     def validate_tool_name(cls, v: str) -> str:
         valid_tools = {
             'semgrep', 'bandit', 'gitleaks', 'npm_audit',
-            'safety', 'osv_scanner', 'trufflehog', 'kunlun'
+            'safety', 'osv_scanner', 'trufflehog', 'kunlun',
+            'slither', 'mythril'
         }
         if v.lower() not in valid_tools:
             raise ValueError(f'Unknown external tool: {v}')

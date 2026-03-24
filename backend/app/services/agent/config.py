@@ -130,6 +130,14 @@ class AgentConfig(BaseSettings):
         default=True,
         description="Enable Kunlun-M static code analyzer"
     )
+    slither_enabled: bool = Field(
+        default=True,
+        description="Enable Slither Solidity static analyzer"
+    )
+    mythril_enabled: bool = Field(
+        default=True,
+        description="Enable Mythril Solidity symbolic execution analyzer"
+    )
 
     # External Tool Timeouts
     semgrep_timeout_seconds: int = Field(
@@ -147,6 +155,14 @@ class AgentConfig(BaseSettings):
     kunlun_timeout_seconds: int = Field(
         default=600,
         description="Timeout for Kunlun-M scanner (10 minutes for deep analysis)"
+    )
+    slither_timeout_seconds: int = Field(
+        default=300,
+        description="Timeout for Slither scanner"
+    )
+    mythril_timeout_seconds: int = Field(
+        default=420,
+        description="Timeout for Mythril scanner"
     )
 
     # ============ Rate Limiting ============
@@ -407,6 +423,20 @@ def get_tool_config(tool_name: str) -> ToolConfig:
             rate_limit_per_second=config.external_tool_rate_per_second,
             fallback_tool="pattern_match",
         ),
+        "slither_scan": ToolConfig(
+            name="slither_scan",
+            enabled=config.slither_enabled,
+            timeout_seconds=config.slither_timeout_seconds,
+            rate_limit_per_second=config.external_tool_rate_per_second,
+            fallback_tool="pattern_match",
+        ),
+        "mythril_scan": ToolConfig(
+            name="mythril_scan",
+            enabled=config.mythril_enabled,
+            timeout_seconds=config.mythril_timeout_seconds,
+            rate_limit_per_second=config.external_tool_rate_per_second,
+            fallback_tool="pattern_match",
+        ),
         "npm_audit": ToolConfig(
             name="npm_audit",
             enabled=config.npm_audit_enabled,
@@ -452,7 +482,11 @@ def get_agent_type_config(agent_type: str) -> AgentTypeConfig:
             agent_type="recon",
             max_iterations=config.recon_max_iterations,
             timeout_seconds=config.sub_agent_timeout_seconds,
-            tools=["list_files", "read_file", "search_code", "semgrep_scan", "gitleaks_scan", "kunlun_scan"],
+            tools=[
+                "list_files", "read_file", "search_code",
+                "semgrep_scan", "gitleaks_scan", "kunlun_scan",
+                "slither_scan", "mythril_scan",
+            ],
             knowledge_modules=["project_analysis"],
         ),
         "analysis": AgentTypeConfig(
@@ -461,7 +495,8 @@ def get_agent_type_config(agent_type: str) -> AgentTypeConfig:
             timeout_seconds=config.sub_agent_timeout_seconds,
             tools=[
                 "smart_scan", "pattern_match", "dataflow_analysis",
-                "read_file", "search_code", "semgrep_scan", "bandit_scan", "kunlun_scan"
+                "read_file", "search_code", "semgrep_scan", "bandit_scan", "kunlun_scan",
+                "slither_scan", "mythril_scan",
             ],
             knowledge_modules=["sql_injection", "xss", "command_injection"],
         ),

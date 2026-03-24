@@ -54,6 +54,8 @@ from .external_tools import (
     SafetyTool,
     TruffleHogTool,
     OSVScannerTool,
+    SlitherTool,
+    MythrilTool,
 )
 
 # 🔥 新增：思考和推理工具
@@ -139,6 +141,8 @@ __all__ = [
     "SafetyTool",
     "TruffleHogTool",
     "OSVScannerTool",
+    "SlitherTool",
+    "MythrilTool",
     
     # 🔥 思考和推理工具
     "ThinkTool",

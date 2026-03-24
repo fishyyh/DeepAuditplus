@@ -7,6 +7,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shlex
 import tempfile
 import shutil
 from typing import Optional, List, Dict, Any
@@ -1136,6 +1138,614 @@ Google 开源的漏洞扫描工具。
             return ToolResult(success=False, data=error_msg, error=error_msg)
 
 
+# Solidity 常用编译器版本（镜像中预装）
+SUPPORTED_SOLC_VERSIONS = [
+    "0.4.26",
+    "0.5.17",
+    "0.6.12",
+    "0.7.6",
+    "0.8.10",
+    "0.8.17",
+    "0.8.20",
+    "0.8.24",
+]
+
+
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    parts = version.split(".")
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def _pick_best_solc_version_from_pragmas(full_target_path: str) -> str:
+    """
+    根据 pragma solidity 约束估算推荐 solc 版本（启发式）
+    """
+    default_version = "0.8.24"
+    constraints: List[str] = []
+    checked_files = 0
+
+    if os.path.isfile(full_target_path) and full_target_path.endswith(".sol"):
+        candidates = [full_target_path]
+    else:
+        candidates = []
+        for root, dirs, files in os.walk(full_target_path):
+            dirs[:] = [d for d in dirs if d not in {"node_modules", "lib", "vendor", ".git", "artifacts", "cache", "out"}]
+            for filename in files:
+                if filename.endswith(".sol"):
+                    candidates.append(os.path.join(root, filename))
+                    if len(candidates) >= 120:
+                        break
+            if len(candidates) >= 120:
+                break
+
+    for file_path in candidates:
+        if checked_files >= 120:
+            break
+        checked_files += 1
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read(4096)
+            matches = re.findall(r"pragma\s+solidity\s+([^;]+);", content, flags=re.IGNORECASE)
+            constraints.extend(matches)
+        except Exception:
+            continue
+
+    if not constraints:
+        return default_version
+
+    preferred_versions: List[tuple[int, int, int]] = []
+    upper_bound_versions: List[tuple[int, int, int]] = []
+
+    for expr in constraints:
+        for m in re.finditer(r"(?P<op>\^|~|>=|<=|>|<|=)?\s*(?P<v>\d+\.\d+\.\d+)", expr):
+            op = (m.group("op") or "").strip()
+            version = _version_tuple(m.group("v"))
+            if op in {"<", "<="}:
+                upper_bound_versions.append(version)
+            else:
+                preferred_versions.append(version)
+
+    supported_tuples = sorted([_version_tuple(v) for v in SUPPORTED_SOLC_VERSIONS])
+    if preferred_versions:
+        target = max(preferred_versions)
+        same_minor = [v for v in supported_tuples if v[0] == target[0] and v[1] == target[1]]
+        if same_minor:
+            return ".".join(map(str, max(same_minor)))
+        same_major_lower_minor = [v for v in supported_tuples if v[0] == target[0] and v[1] <= target[1]]
+        if same_major_lower_minor:
+            return ".".join(map(str, max(same_major_lower_minor)))
+
+    if upper_bound_versions:
+        upper = min(upper_bound_versions)
+        lower_candidates = [v for v in supported_tuples if v < upper]
+        if lower_candidates:
+            return ".".join(map(str, max(lower_candidates)))
+
+    return default_version
+
+
+def _normalize_scan_target_rel(safe_target_path: str) -> str:
+    if safe_target_path in {"", ".", "./"}:
+        return "."
+    return safe_target_path.lstrip("./")
+
+
+def _build_solidity_prepare_cmd(scan_target_rel: str, solc_version: str) -> str:
+    """
+    在容器中准备可写扫描工作目录，并尽量完成编译前置步骤。
+    """
+    quoted_target = shlex.quote(scan_target_rel)
+    return (
+        "set -e; "
+        "rm -rf /tmp/solscan && mkdir -p /tmp/solscan; "
+        "cp -a /workspace/. /tmp/solscan/; "
+        "cd /tmp/solscan; "
+        f"if command -v solc-select >/dev/null 2>&1; then solc-select use {shlex.quote(solc_version)} >/tmp/solc-select.log 2>&1 || true; fi; "
+        "if [ -f foundry.toml ] && command -v forge >/dev/null 2>&1; then forge build -q >/tmp/forge-build.log 2>&1 || true; fi; "
+        "if ls hardhat.config.* >/dev/null 2>&1; then "
+        "  if [ ! -d node_modules ] && [ -f package-lock.json ]; then npm ci --ignore-scripts --no-audit --silent >/tmp/npm-ci.log 2>&1 || true; fi; "
+        "  npx hardhat compile --force >/tmp/hardhat-compile.log 2>&1 || true; "
+        "fi; "
+        "if [ -f truffle-config.js ] || [ -f truffle.js ]; then "
+        "  if [ ! -d node_modules ] && [ -f package-lock.json ]; then npm ci --ignore-scripts --no-audit --silent >/tmp/npm-ci.log 2>&1 || true; fi; "
+        "  npx truffle compile >/tmp/truffle-compile.log 2>&1 || true; "
+        "fi; "
+        f"test -e {quoted_target} || true"
+    )
+
+
+# ============ Slither 工具 (Solidity 静态分析) ============
+
+class SlitherInput(BaseModel):
+    """Slither 扫描输入"""
+    target_path: str = Field(
+        default=".",
+        description="要扫描的路径。使用 '.' 扫描整个项目（推荐），不要使用项目目录名！"
+    )
+    detectors: Optional[str] = Field(
+        default=None,
+        description="指定 detector 过滤，如 'reentrancy-eth,tx-origin'。为空时使用默认 detector 集合"
+    )
+    exclude_dependencies: bool = Field(
+        default=True,
+        description="是否排除依赖目录中的结果，降低噪声"
+    )
+    max_results: int = Field(default=50, ge=1, le=200, description="最大返回结果数")
+
+
+class SlitherTool(AgentTool):
+    """
+    Slither Solidity 静态分析工具
+
+    Slither 是 Trail of Bits 的 Solidity 静态分析工具，
+    适合快速发现常见智能合约安全问题。
+    """
+
+    def __init__(self, project_root: str, sandbox_manager: Optional["SandboxManager"] = None):
+        super().__init__()
+        self.project_root = os.path.abspath(project_root)
+        self.sandbox_manager = sandbox_manager or SandboxManager()
+
+    @property
+    def name(self) -> str:
+        return "slither_scan"
+
+    @property
+    def description(self) -> str:
+        return """使用 Slither 扫描 Solidity 智能合约安全问题。
+Slither 是成熟的智能合约静态分析工具，适合作为 Solidity 审计主力扫描器。
+
+⚠️ 重要提示: target_path 使用 '.' 扫描整个项目，不要使用项目目录名！"""
+
+    @property
+    def args_schema(self):
+        return SlitherInput
+
+    async def _execute(
+        self,
+        target_path: str = ".",
+        detectors: Optional[str] = None,
+        exclude_dependencies: bool = True,
+        max_results: int = 50,
+        **kwargs
+    ) -> ToolResult:
+        """执行 Slither 扫描"""
+        await self.sandbox_manager.initialize()
+        if not self.sandbox_manager.is_available:
+            error_msg = f"Slither unavailable: {self.sandbox_manager.get_diagnosis()}"
+            return ToolResult(success=False, data=error_msg, error=error_msg)
+
+        safe_target_path, host_check_path, error_msg = _smart_resolve_target_path(
+            target_path, self.project_root, "Slither"
+        )
+        if error_msg:
+            return ToolResult(success=False, data=error_msg, error=error_msg)
+
+        # 优先检查命令是否存在，给出更明确的错误提示
+        version_check = await self.sandbox_manager.execute_tool_command(
+            command="slither --version",
+            host_workdir=self.project_root,
+            timeout=20
+        )
+        if not version_check.get("success"):
+            missing_msg = "Slither 不可用：容器中未安装 slither（或执行失败）"
+            stderr_hint = (version_check.get("stderr") or version_check.get("error") or "").strip()
+            if stderr_hint:
+                missing_msg = f"{missing_msg}，详情: {stderr_hint[:200]}"
+            return ToolResult(success=False, data=missing_msg, error=missing_msg)
+
+        scan_target_rel = _normalize_scan_target_rel(safe_target_path)
+        inferred_solc = _pick_best_solc_version_from_pragmas(host_check_path)
+        prepare_cmd = _build_solidity_prepare_cmd(scan_target_rel, inferred_solc)
+
+        cmd = [
+            "slither",
+            scan_target_rel,
+            "--json", "/tmp/slither-report.json",
+        ]
+        if exclude_dependencies:
+            cmd.append("--exclude-dependencies")
+        if detectors:
+            cmd.extend(["--detect", detectors])
+
+        cmd_str = " ".join(cmd)
+        # Slither 遇到检测结果时可能返回非 0，统一保留输出再解析
+        wrapped_cmd = (
+            f"{prepare_cmd}; "
+            f"cd /tmp/solscan && {cmd_str} >/tmp/slither-stdout.log 2>/tmp/slither-stderr.log || true; "
+            "cat /tmp/slither-report.json 2>/dev/null || true"
+        )
+
+        try:
+            result = await self.sandbox_manager.execute_tool_command(
+                command=wrapped_cmd,
+                host_workdir=self.project_root,
+                timeout=420,
+                network_mode="bridge",
+            )
+
+            stdout = result.get("stdout", "")
+            stderr = result.get("stderr", "")
+
+            if not stdout.strip():
+                # 尝试读取 stderr 日志帮助定位
+                err_probe = await self.sandbox_manager.execute_tool_command(
+                    command=(
+                        "cat /tmp/slither-stderr.log /tmp/forge-build.log "
+                        "/tmp/hardhat-compile.log /tmp/truffle-compile.log "
+                        "/tmp/npm-ci.log /tmp/solc-select.log 2>/dev/null || true"
+                    ),
+                    host_workdir=self.project_root,
+                    timeout=10
+                )
+                err_text = (err_probe.get("stdout") or stderr or result.get("error") or "").strip()
+                if err_text:
+                    msg = f"Slither 扫描未产生可解析结果: {err_text[:300]}"
+                    return ToolResult(success=False, data=msg, error=msg)
+                return ToolResult(
+                    success=True,
+                    data="🛡️ Slither 扫描完成，未发现 Solidity 安全问题",
+                    metadata={"findings_count": 0}
+                )
+
+            try:
+                json_start = stdout.find("{")
+                if json_start < 0:
+                    return ToolResult(
+                        success=True,
+                        data="🛡️ Slither 扫描完成，未发现 Solidity 安全问题",
+                        metadata={"findings_count": 0}
+                    )
+                parsed = json.loads(stdout[json_start:])
+            except Exception as e:
+                msg = f"无法解析 Slither 输出: {str(e)}"
+                return ToolResult(success=False, data=msg, error=msg)
+
+            if isinstance(parsed, dict) and parsed.get("success") is False and parsed.get("error"):
+                slither_err = str(parsed.get("error", "")).strip()
+                msg = f"Slither 扫描失败: {slither_err[:300]}"
+                return ToolResult(success=False, data=msg, error=msg)
+
+            detectors_list = (
+                parsed.get("results", {}).get("detectors", [])
+                if isinstance(parsed, dict)
+                else []
+            )
+            findings = detectors_list[:max_results]
+
+            if not findings:
+                return ToolResult(
+                    success=True,
+                    data="🛡️ Slither 扫描完成，未发现 Solidity 安全问题",
+                    metadata={"findings_count": 0}
+                )
+
+            output_parts = ["🧪 Slither Solidity 扫描结果\n", f"发现 {len(findings)} 个问题:\n"]
+            severity_icons = {"High": "🔴", "Medium": "🟠", "Low": "🟡", "Informational": "⚪"}
+
+            compact_findings: List[Dict[str, Any]] = []
+            for i, finding in enumerate(findings, 1):
+                impact = str(finding.get("impact", "Medium"))
+                icon = severity_icons.get(impact, "⚪")
+                title = finding.get("check", "unknown")
+                desc = str(finding.get("description", "")).strip().replace("\n", " ")
+                conf = finding.get("confidence", "Medium")
+
+                location = ""
+                elements = finding.get("elements", [])
+                if elements and isinstance(elements, list):
+                    first = elements[0] if isinstance(elements[0], dict) else {}
+                    src = first.get("source_mapping", {}) if isinstance(first, dict) else {}
+                    filename = src.get("filename_relative") or src.get("filename_short") or src.get("filename_absolute")
+                    lines = src.get("lines") or []
+                    if filename:
+                        if lines and isinstance(lines, list):
+                            location = f"{filename}:{lines[0]}"
+                        else:
+                            location = filename
+
+                output_parts.append(f"\n{icon} [{impact}] {title}")
+                if location:
+                    output_parts.append(f"   文件: {location}")
+                output_parts.append(f"   置信度: {conf}")
+                if desc:
+                    output_parts.append(f"   描述: {desc[:220]}")
+
+                compact_findings.append(
+                    {
+                        "type": title,
+                        "impact": impact,
+                        "confidence": conf,
+                        "location": location,
+                        "solc_version": inferred_solc,
+                    }
+                )
+
+            return ToolResult(
+                success=True,
+                data="\n".join(output_parts),
+                metadata={
+                    "findings_count": len(findings),
+                    "findings": compact_findings[:20],
+                    "solc_version": inferred_solc,
+                }
+            )
+        except Exception as e:
+            error_msg = f"Slither 执行错误: {str(e)}"
+            return ToolResult(success=False, data=error_msg, error=error_msg)
+
+
+# ============ Mythril 工具 (Solidity 符号执行) ============
+
+class MythrilInput(BaseModel):
+    """Mythril 扫描输入"""
+    target_path: str = Field(
+        default=".",
+        description="要扫描的路径。支持项目目录或单个 .sol 文件"
+    )
+    execution_timeout: int = Field(
+        default=90,
+        ge=10,
+        le=600,
+        description="每个合约文件的符号执行超时（秒）"
+    )
+    max_files: int = Field(
+        default=8,
+        ge=1,
+        le=30,
+        description="最多扫描的 Solidity 文件数量（避免超时）"
+    )
+    max_results: int = Field(
+        default=50,
+        ge=1,
+        le=200,
+        description="最大返回漏洞条目数"
+    )
+
+
+class MythrilTool(AgentTool):
+    """
+    Mythril Solidity 符号执行工具
+
+    Mythril 通过符号执行发现更深层的可利用路径，
+    适合作为 Slither 静态扫描后的补充验证器。
+    """
+
+    def __init__(self, project_root: str, sandbox_manager: Optional["SandboxManager"] = None):
+        super().__init__()
+        self.project_root = os.path.abspath(project_root)
+        self.sandbox_manager = sandbox_manager or SandboxManager()
+
+    @property
+    def name(self) -> str:
+        return "mythril_scan"
+
+    @property
+    def description(self) -> str:
+        return """使用 Mythril 对 Solidity 合约进行符号执行扫描。
+适合补充静态规则检测，发现可利用执行路径。"""
+
+    @property
+    def args_schema(self):
+        return MythrilInput
+
+    def _collect_solidity_files(self, full_target_path: str, max_files: int) -> List[str]:
+        """收集合约文件，返回相对于 project_root 的路径"""
+        sol_files: List[str] = []
+
+        if os.path.isfile(full_target_path) and full_target_path.lower().endswith(".sol"):
+            rel = os.path.relpath(full_target_path, self.project_root)
+            return [rel]
+
+        for root, dirs, files in os.walk(full_target_path):
+            # 跳过常见依赖目录，减少噪声和耗时
+            dirs[:] = [d for d in dirs if d not in {"node_modules", "lib", "vendor", ".git", "artifacts", "cache", "out"}]
+            for filename in files:
+                if not filename.lower().endswith(".sol"):
+                    continue
+                rel_path = os.path.relpath(os.path.join(root, filename), self.project_root)
+                sol_files.append(rel_path)
+                if len(sol_files) >= max_files:
+                    return sol_files
+        return sol_files
+
+    async def _execute(
+        self,
+        target_path: str = ".",
+        execution_timeout: int = 90,
+        max_files: int = 8,
+        max_results: int = 50,
+        **kwargs
+    ) -> ToolResult:
+        """执行 Mythril 扫描"""
+        await self.sandbox_manager.initialize()
+        if not self.sandbox_manager.is_available:
+            error_msg = f"Mythril unavailable: {self.sandbox_manager.get_diagnosis()}"
+            return ToolResult(success=False, data=error_msg, error=error_msg)
+
+        safe_target_path, host_check_path, error_msg = _smart_resolve_target_path(
+            target_path, self.project_root, "Mythril"
+        )
+        if error_msg:
+            return ToolResult(success=False, data=error_msg, error=error_msg)
+
+        version_check = await self.sandbox_manager.execute_tool_command(
+            command="myth --version",
+            host_workdir=self.project_root,
+            timeout=20
+        )
+        if not version_check.get("success"):
+            missing_msg = "Mythril 不可用：容器中未安装 mythril（或执行失败）"
+            stderr_hint = (version_check.get("stderr") or version_check.get("error") or "").strip()
+            if stderr_hint:
+                missing_msg = f"{missing_msg}，详情: {stderr_hint[:200]}"
+            return ToolResult(success=False, data=missing_msg, error=missing_msg)
+
+        scan_target_rel = _normalize_scan_target_rel(safe_target_path)
+        inferred_solc = _pick_best_solc_version_from_pragmas(host_check_path)
+        prepare_cmd = _build_solidity_prepare_cmd(scan_target_rel, inferred_solc)
+        prepare_result = await self.sandbox_manager.execute_tool_command(
+            command=f"{prepare_cmd}; echo PREPARED",
+            host_workdir=self.project_root,
+            timeout=420,
+            network_mode="bridge",
+        )
+        if not prepare_result.get("success"):
+            prep_error = (prepare_result.get("stderr") or prepare_result.get("error") or "unknown").strip()
+            msg = f"Mythril 预编译环境准备失败: {prep_error[:240]}"
+            return ToolResult(success=False, data=msg, error=msg)
+
+        sol_files = self._collect_solidity_files(host_check_path, max_files=max_files)
+        if not sol_files:
+            return ToolResult(
+                success=True,
+                data=f"Mythril: 在目标路径未找到 Solidity 文件 ({safe_target_path})",
+                metadata={"findings_count": 0, "scanned_files": 0}
+            )
+
+        findings: List[Dict[str, Any]] = []
+        scan_errors: List[str] = []
+
+        for rel_file in sol_files:
+            cmd = (
+                f"cd /tmp/solscan && myth analyze {shlex.quote(rel_file)} -o json --execution-timeout {execution_timeout} "
+                ">/tmp/mythril-stdout.json 2>/tmp/mythril-stderr.log || true; "
+                "cat /tmp/mythril-stdout.json 2>/dev/null || true"
+            )
+            result = await self.sandbox_manager.execute_tool_command(
+                command=cmd,
+                host_workdir=self.project_root,
+                timeout=max(150, execution_timeout + 60),
+                network_mode="bridge",
+            )
+
+            stdout = (result.get("stdout") or "").strip()
+            stderr = (result.get("stderr") or "").strip()
+
+            if not stdout:
+                if not stderr:
+                    err_probe = await self.sandbox_manager.execute_tool_command(
+                        command=(
+                            "cat /tmp/mythril-stderr.log /tmp/forge-build.log "
+                            "/tmp/hardhat-compile.log /tmp/truffle-compile.log "
+                            "/tmp/npm-ci.log /tmp/solc-select.log 2>/dev/null || true"
+                        ),
+                        host_workdir=self.project_root,
+                        timeout=10
+                    )
+                    stderr = (err_probe.get("stdout") or "").strip()
+                if stderr:
+                    scan_errors.append(f"{rel_file}: {stderr[:160]}")
+                continue
+
+            try:
+                # Mythril 输出可能含日志，提取 JSON 起始
+                json_start_obj = stdout.find("{")
+                json_start_arr = stdout.find("[")
+                starts = [i for i in [json_start_obj, json_start_arr] if i >= 0]
+                if not starts:
+                    continue
+                payload = json.loads(stdout[min(starts):])
+            except Exception:
+                scan_errors.append(f"{rel_file}: 无法解析 Mythril 输出")
+                continue
+
+            issues = []
+            if isinstance(payload, dict):
+                issues = payload.get("issues", []) or []
+            elif isinstance(payload, list):
+                issues = payload
+
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                findings.append(
+                    {
+                        "file": rel_file,
+                        "title": issue.get("title", "Unknown"),
+                        "severity": issue.get("severity", "Unknown"),
+                        "swc_id": issue.get("swc-id") or issue.get("swc_id"),
+                        "description": issue.get("description", ""),
+                        "locations": issue.get("locations", []),
+                    }
+                )
+                if len(findings) >= max_results:
+                    break
+
+            if len(findings) >= max_results:
+                break
+
+        if not findings:
+            if scan_errors:
+                return ToolResult(
+                    success=True,
+                    data=f"Mythril 未发现可确认问题（部分文件扫描异常）: {'; '.join(scan_errors[:5])}",
+                    metadata={
+                        "findings_count": 0,
+                        "scanned_files": len(sol_files),
+                        "errors": scan_errors[:20],
+                    }
+                )
+            return ToolResult(
+                success=True,
+                data="🛡️ Mythril 扫描完成，未发现可利用风险",
+                metadata={"findings_count": 0, "scanned_files": len(sol_files)}
+            )
+
+        output_parts = ["⚙️ Mythril 符号执行扫描结果\n", f"扫描文件: {len(sol_files)}，发现问题: {len(findings)}\n"]
+        severity_icons = {"High": "🔴", "Medium": "🟠", "Low": "🟡", "Unknown": "⚪"}
+
+        compact_findings: List[Dict[str, Any]] = []
+        for i, finding in enumerate(findings[:max_results], 1):
+            sev = str(finding.get("severity", "Unknown"))
+            icon = severity_icons.get(sev, "⚪")
+            title = finding.get("title", "Unknown")
+            swc = finding.get("swc_id") or "N/A"
+            file_path = finding.get("file", "")
+            desc = str(finding.get("description", "")).replace("\n", " ").strip()
+
+            line_info = ""
+            locations = finding.get("locations", [])
+            if locations and isinstance(locations, list):
+                first_loc = locations[0] if isinstance(locations[0], dict) else {}
+                src = first_loc.get("source_map", "") if isinstance(first_loc, dict) else ""
+                if src:
+                    line_info = src
+
+            output_parts.append(f"\n{icon} [{sev}] {title} (SWC: {swc})")
+            output_parts.append(f"   文件: {file_path}")
+            if line_info:
+                output_parts.append(f"   定位: {line_info}")
+            if desc:
+                output_parts.append(f"   描述: {desc[:220]}")
+
+                compact_findings.append(
+                    {
+                        "title": title,
+                        "severity": sev,
+                        "swc_id": swc,
+                        "file": file_path,
+                        "location": line_info,
+                        "solc_version": inferred_solc,
+                    }
+                )
+
+        metadata = {
+            "findings_count": len(findings),
+            "scanned_files": len(sol_files),
+            "findings": compact_findings[:20],
+            "solc_version": inferred_solc,
+        }
+        if scan_errors:
+            metadata["errors"] = scan_errors[:20]
+
+        return ToolResult(
+            success=True,
+            data="\n".join(output_parts),
+            metadata=metadata
+        )
+
+
 # ============ 导出所有工具 ============
 
 __all__ = [
@@ -1146,5 +1756,6 @@ __all__ = [
     "SafetyTool",
     "TruffleHogTool",
     "OSVScannerTool",
+    "SlitherTool",
+    "MythrilTool",
 ]
-
