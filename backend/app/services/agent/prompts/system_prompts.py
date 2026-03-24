@@ -148,6 +148,63 @@ VULNERABILITY_PRIORITIES = """
 11. **弱加密** - MD5、SHA1、DES
 12. **不安全传输** - HTTP、明文密码
 13. **日志记录敏感信息**
+
+---
+
+## Solidity / 智能合约专项漏洞优先级
+
+> 检测到 `.sol` 文件时，**优先运行** `slither_scan` + `mythril_scan`，再结合以下清单手工复核。
+
+### 🔴 Critical - 直接资金损失
+1. **重入漏洞（Reentrancy）**
+   - Source: `.call{value:}(...)` / 外部合约调用
+   - Sink: 先执行外部调用，再修改余额/状态（违反 CEI 原则）
+   - 检测: 外部 call 后才出现 `balances[x] -=` / `_burn()` / 状态归零
+   - 修复: 遵循 Checks-Effects-Interactions；或使用 `nonReentrant`
+
+2. **预言机/闪贷操控（Oracle Manipulation）**
+   - Source: `getReserves()` / `latestAnswer()` / AMM spot price
+   - 风险: 闪贷可在单笔交易内操控价格，套取超额抵押贷款
+   - 检测: 价格计算直接使用 `reserve0/reserve1`，且无 TWAP 保护
+   - 修复: Uniswap V3 TWAP 或 Chainlink 聚合预言机
+
+3. **整数溢出/下溢（Integer Overflow）**
+   - 适用: `pragma solidity ^0.7` 及以下（无内置检查）
+   - Sink: 乘法/加法/减法未使用 SafeMath
+   - 检测: `pragma` 版本 <0.8.0 + 金融计算无 SafeMath
+
+### 🟠 High - 权限与签名安全
+4. **访问控制缺陷（Access Control）**
+   - `tx.origin` 用于权限判断（可被中间合约绕过）
+   - `initialize()` 缺少 `initializer`（Proxy 二次调用）
+   - 特权函数（mint/burn/pause/upgrade）无访问控制修饰符
+
+5. **签名重放攻击（Signature Replay）**
+   - `ecrecover` 返回值未检查是否为 `address(0)`
+   - 签名消息缺少 `nonce` 或 `chainId`（重放/跨链攻击）
+   - 非 EIP-712 标准签名（建议迁移）
+
+6. **危险低级调用（Dangerous Low-Level Calls）**
+   - `delegatecall` 目标地址用户可控（存储污染/逻辑劫持）
+   - `selfdestruct` 无适当访问控制
+   - `.call()` 返回值未检查（失败静默）
+
+### 🟡 Medium - 逻辑与配置
+7. **可预测随机源（Predictable Randomness）**
+   - `block.timestamp` / `blockhash` 用作随机熵
+   - 矿工/验证者可操控以获取有利结果
+
+8. **浮动编译器版本（Floating Pragma）**
+   - `pragma solidity ^0.X` 应锁定为具体版本
+
+9. **unchecked 块滥用**
+   - 在 `unchecked { }` 中对金融计算执行加减乘（主动绕过溢出检查）
+
+10. **Gas Limit DoS / Push Payment 阻断**
+    - Push 分红：循环内直接 `.transfer()` / `.call{value:}()`，任意接收方 `receive()` revert 可永久阻断合约
+    - `require(token.transfer(...))` 外部转账成功，接收方可故意 revert 阻断整个流程
+    - 无界地址数组循环（`for i < recipients.length`）Gas 耗尽 DoS
+    - 修复：改为 Pull Payment（用户主动 `claim()`），循环改为分批（pagination）
 </vulnerability_priorities>
 """
 
@@ -343,6 +400,154 @@ Final Answer: {
 </tool_usage_guide>
 """
 
+# DeFi 业务逻辑漏洞分析指南
+SOLIDITY_BUSINESS_LOGIC_GUIDE = """
+<solidity_business_logic_guide>
+## Solidity 业务逻辑漏洞分析方法论
+
+> 业务逻辑漏洞无法被静态工具完全检测，需要理解协议意图并手动推理。
+> 以下是分析流程和各协议类型专项清单。
+
+---
+
+### Step 1：协议类型识别（看文件名 / import / 关键词）
+
+| 协议类型 | 识别关键词 |
+|---------|-----------|
+| **DEX / AMM** | `swap`, `addLiquidity`, `getReserves`, `UniswapV2`, `Curve` |
+| **借贷 / Lending** | `collateral`, `borrow`, `repay`, `liquidate`, `healthFactor` |
+| **NFT** | `ERC721`, `ERC1155`, `mint`, `tokenURI`, `safeTransferFrom` |
+| **质押 / Staking** | `stake`, `unstake`, `rewardPerToken`, `getReward`, `Synthetix` |
+| **跨链 / Bridge** | `lzReceive`, `ccipReceive`, `xReceive`, `bridge`, `relay` |
+| **治理 / Governance** | `propose`, `vote`, `execute`, `quorum`, `TimelockController` |
+| **代理 / Proxy** | `upgradeTo`, `initialize`, `delegatecall`, `EIP1967`, `UUPS` |
+| **多签 / Multisig** | `threshold`, `owners`, `execTransaction`, `GnosisSafe` |
+
+---
+
+### Step 2：不变量审计（每个协议都有核心数学约束）
+
+**不变量** = 任何函数执行前后都必须保持成立的条件。违反不变量即为漏洞。
+
+```
+DEX:     totalAssets = reserve0 * reserve1 ≥ k（k 只能增不减）
+借贷:    totalBorrows ≤ totalLiquidity；healthFactor < 1 才可清算
+Staking: totalRewardDistributed ≤ totalRewardBudget；用户份额公平
+NFT:     totalMinted ≤ maxSupply；tokenId 唯一且不可重用
+Vault:   totalAssets = sum(userDeposits) + yield（无资金凭空消失）
+```
+
+**分析步骤**：
+1. 找出合约的核心不变量（通常在 README 或注释中描述）
+2. 对每个 `external`/`public` 函数验证不变量是否始终维护
+3. 重点检查：有无路径可以在不满足条件的情况下修改关键状态
+
+---
+
+### Step 3：资金流追踪
+
+```
+入口（source）→ 中间状态 → 出口（sink）
+deposit()     → balances[]  → withdraw()
+stake()       → _balances[] → unstake() + getReward()
+```
+
+**检查要点**：
+- 所有 token 入口（`transferFrom`）是否有对应出口（`transfer`）
+- 手续费是否正确扣除并归属
+- 精度处理（先乘后除，基数 1e18）
+- `balanceOf` vs 内部记账变量（优先内部变量）
+
+---
+
+### Step 4：各协议类型专项清单
+
+#### 🔵 DEX / AMM
+```
+☐ 首次流动性：是否有 MINIMUM_LIQUIDITY 防止首存价格操控
+☐ 储备变量：使用内部 reserve 还是实时 balanceOf（后者可被操控）
+☐ 手续费：在 invariant 检查前还是后计算（前才正确）
+☐ 滑点保护：amountOutMin 是否可为 0
+☐ 价格预言机：getReserves 现货还是 TWAP（前者可被闪贷操控）
+☐ 同区块操作：是否有防止同区块多次 swap 的保护
+```
+
+#### 🟠 借贷 / Lending
+```
+☐ 健康因子：使用 Chainlink 喂价 vs AMM 现货（前者安全）
+☐ 清算激励：奖励是否 5%-15%（过低无人清算，协议积累坏账）
+☐ 清算阻断：借款人 receive() 能否 revert 阻止清算（应使用 pull 模式）
+☐ 部分清算：清算后 healthFactor 是否必须改善
+☐ 利率上界：totalBorrows 是否有 utilization 上限（防止全额借走）
+☐ 精度：抵押率 * 价格计算是否先乘后除，有无四舍五入方向
+```
+
+#### 🟡 NFT
+```
+☐ tokenId 预测：使用计数器还是 block 数据（后者可被抢跑）
+☐ safeTransferFrom：调用处是否有 nonReentrant
+☐ maxSupply：mint 函数是否有总量限制
+☐ 单地址限制：是否有 MAX_PER_WALLET 防止一人囤积
+☐ baseURI：是否 immutable 或指向 IPFS 不可变地址
+☐ 版税：是否实现 EIP-2981（supportsInterface(0x2a55205a)）
+```
+
+#### 🟢 质押 / Staking
+```
+☐ 除零保护：rewardPerToken() 中 totalSupply=0 时是否 return 早退
+☐ 代币分离：rewardToken != stakingToken（同代币有重入路径）
+☐ 内部记账：_totalSupply/_balances vs 外部 balanceOf（使用内部变量）
+☐ 奖励累积：只在 totalStaked > 0 时累积，避免"空气"奖励膨胀
+☐ 重入保护：stake/unstake/getReward 各自有 nonReentrant
+☐ 闪电套利：是否有最小锁仓期（防止单块 stake→reward→unstake）
+☐ 奖励预算：notifyRewardAmount 传入的奖励总量是否 <= 合约实际余额
+```
+
+#### 🔴 治理 / Governance
+```
+☐ 快照机制：投票权基于 getPastVotes（历史快照）还是 balanceOf（实时）
+☐ votingDelay：> 0（建议 ≥ 7200 blocks ≈ 1 天）
+☐ quorum：> 0 且设置合理（建议总供应量的 2-4%）
+☐ Timelock：提案执行需经 TimelockController（建议 ≥ 48h 延迟）
+☐ 提案内容：targets/calldatas 是否可以包含任意危险调用
+☐ 单大户：单一地址是否可独立满足 quorum 并通过提案
+```
+
+#### 🟣 代理合约 / Upgradeable
+```
+☐ _disableInitializers：逻辑合约构造函数是否调用
+☐ initializer modifier：initialize() 是否加 initializer
+☐ 存储布局：升级时只追加变量，不修改/删除已有变量
+☐ EIP-1967 slots：implementation/admin 使用标准 slot
+☐ upgradeTo 保护：是否有 Timelock + 多签（或 onlyOwner）
+☐ 父合约初始化：__xxx_init() 是否全部调用
+```
+
+#### ⚫ 多签 / Multisig
+```
+☐ 去重：签名数组按地址排序，检测重复签名
+☐ 阈值变更：需满足当前 threshold 的多签才能修改 threshold
+☐ Nonce：严格递增（不允许跳跃/复用）
+☐ 签名域：包含 chainId + address(this) 防重放
+☐ delegatecall：目标地址有无白名单限制
+☐ 推荐：直接使用 Gnosis Safe 而非自实现
+```
+
+---
+
+### Step 5：README vs 代码一致性核查
+
+当 README 存在时，必须验证：
+1. 声明的访问控制（"only owner can"）→ 代码中是否有对应 modifier
+2. 声明的经济模型（"fee = 0.3%"）→ 代码中费率是否与声明一致
+3. 声明的安全机制（"uses TWAP"）→ 代码中是否真正使用 TWAP
+4. 声明的限制（"max 10 per wallet"）→ 代码中是否有对应 require
+
+**文档与代码不一致即为业务逻辑漏洞，需报告。**
+
+</solidity_business_logic_guide>
+"""
+
 # 动态Agent系统规则
 MULTI_AGENT_RULES = """
 <multi_agent_rules>
@@ -382,7 +587,8 @@ def build_enhanced_prompt(
     include_principles: bool = True,
     include_priorities: bool = True,
     include_tools: bool = True,
-    include_validation: bool = True,  # 🔥 v2.1: 默认包含文件验证规则
+    include_validation: bool = True,
+    include_solidity_biz_logic: bool = False,  # 仅 Solidity 项目时注入
 ) -> str:
     """
     构建增强的提示词
@@ -412,14 +618,18 @@ def build_enhanced_prompt(
     if include_tools:
         parts.append(TOOL_USAGE_GUIDE)
 
+    if include_solidity_biz_logic:
+        parts.append(SOLIDITY_BUSINESS_LOGIC_GUIDE)
+
     return "\n\n".join(parts)
 
 
 __all__ = [
     "CORE_SECURITY_PRINCIPLES",
-    "FILE_VALIDATION_RULES",  # 🔥 v2.1
+    "FILE_VALIDATION_RULES",
     "VULNERABILITY_PRIORITIES",
     "TOOL_USAGE_GUIDE",
+    "SOLIDITY_BUSINESS_LOGIC_GUIDE",
     "MULTI_AGENT_RULES",
     "build_enhanced_prompt",
 ]

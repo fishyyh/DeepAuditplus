@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, TaskHandoff
 from ..json_parser import AgentJsonParser
-from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES
+from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES, SOLIDITY_BUSINESS_LOGIC_GUIDE
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +344,35 @@ class AnalysisAgent(BaseAgent):
             return True
 
         return any(str(path).lower().endswith(".sol") for path in (target_files or []))
+
+    @staticmethod
+    def _detect_protocol_type(
+        readme_context: str,
+        target_files: List[str],
+    ) -> List[str]:
+        """从 README 文本和文件名中识别 DeFi 协议类型。
+
+        返回检测到的协议类型列表（如 ['DEX/AMM', '质押/Staking']）。
+        """
+        text = (readme_context + " " + " ".join(str(f) for f in target_files)).lower()
+
+        protocol_keywords: Dict[str, List[str]] = {
+            "DEX/AMM": ["swap", "addliquidity", "getreserves", "uniswapv2", "uniswapv3", "curve", "balancer", " amm", " dex", "pool", "liquidity"],
+            "借贷/Lending": ["collateral", "borrow", "repay", "liquidat", "healthfactor", "lending", "loan", "aave", "compound"],
+            "NFT": ["erc721", "erc1155", "mint", "tokenuri", "safetransferfrom", " nft", "collectible", "opensea"],
+            "质押/Staking": ["stake", "unstake", "rewardpertoken", "getreward", "synthetix", "staking", "rewardsduration"],
+            "跨链/Bridge": ["lzreceive", "ccipreceive", "xreceive", "bridge", "relay", "crosschain", "layerzero", "axelar"],
+            "治理/Governance": ["propose", " vote", "execute", "quorum", "timelockcontroller", "governance", "dao"],
+            "代理合约/Proxy": ["upgradeto", "initialize", "delegatecall", "eip1967", "uups", "upgradeable", "transparentproxy"],
+            "多签/Multisig": ["threshold", "exectransaction", "gnosissafe", "multisig", "safetx"],
+        }
+
+        detected: List[str] = []
+        for protocol_type, keywords in protocol_keywords.items():
+            if any(kw in text for kw in keywords):
+                detected.append(protocol_type)
+
+        return detected
 
     @staticmethod
     def _safe_project_root(project_root: str) -> str:
@@ -872,6 +901,8 @@ class AnalysisAgent(BaseAgent):
 
 """
         if is_solidity:
+            protocol_types = self._detect_protocol_type(solidity_readme_context, target_files)
+
             if solidity_readme_context:
                 initial_message += f"""## 🧭 Solidity 业务逻辑上下文（自动提取自 README）
 {solidity_readme_context}
@@ -883,6 +914,14 @@ class AnalysisAgent(BaseAgent):
                 initial_message += """## 🧭 Solidity 业务逻辑审计要求
 当前未提取到 README 业务上下文。请优先读取项目 README/文档文件，再结合代码进行业务逻辑漏洞审计（资金流、状态机、权限边界、不变量）。
 
+"""
+            if protocol_types:
+                initial_message += f"""## 🔍 检测到的协议类型
+当前项目疑似包含以下协议类型：**{", ".join(protocol_types)}**
+请在下方业务逻辑分析指南的 Step 4 中，**优先**执行对应类型的专项清单。
+
+"""
+            initial_message += f"""{SOLIDITY_BUSINESS_LOGIC_GUIDE}
 """
         # 🔥 如果指定了目标文件，明确告知 Agent
         if target_files:
