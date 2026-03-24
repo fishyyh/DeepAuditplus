@@ -47,6 +47,98 @@ _running_tasks: Dict[str, Any] = {}
 _running_asyncio_tasks: Dict[str, asyncio.Task] = {}
 
 
+# ============ Default Vulnerabilities by Language ============
+
+WEB_DEFAULT_VULNERABILITIES = [
+    "sql_injection",
+    "xss",
+    "command_injection",
+    "path_traversal",
+    "ssrf",
+]
+
+SOLIDITY_DEFAULT_VULNERABILITIES = [
+    "auth_bypass",
+    "race_condition",
+    "code_injection",
+    "business_logic",
+    "sensitive_data_exposure",
+    "hardcoded_secret",
+    "weak_crypto",
+]
+
+GENERIC_DEFAULT_VULNERABILITIES = [
+    "auth_bypass",
+    "business_logic",
+    "sensitive_data_exposure",
+    "hardcoded_secret",
+]
+
+
+def _extract_project_languages(project: Project) -> List[str]:
+    """从项目记录中提取并标准化语言列表。"""
+    raw = project.programming_languages
+    parsed: Any = []
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = [raw]
+    elif isinstance(raw, (list, tuple, set, dict)):
+        parsed = raw
+
+    languages: List[str] = []
+    if isinstance(parsed, dict):
+        iterable = list(parsed.keys())
+    elif isinstance(parsed, (list, tuple, set)):
+        iterable = list(parsed)
+    else:
+        iterable = [parsed] if parsed else []
+
+    for item in iterable:
+        if item is None:
+            continue
+        text = str(item).strip().lower()
+        if text:
+            languages.append(text)
+
+    # 去重并保持顺序
+    seen = set()
+    normalized: List[str] = []
+    for lang in languages:
+        if lang not in seen:
+            seen.add(lang)
+            normalized.append(lang)
+    return normalized
+
+
+def _infer_default_target_vulnerabilities(
+    project: Project,
+    target_files: Optional[List[str]] = None,
+) -> List[str]:
+    """根据项目语言推断默认漏洞类型。"""
+    languages = _extract_project_languages(project)
+    language_text = " ".join(languages)
+    target_files = target_files or []
+    has_solidity_files = any(str(path).lower().endswith(".sol") for path in target_files)
+
+    # 智能合约优先（用户最关心的场景）
+    if has_solidity_files or any(keyword in language_text for keyword in ("solidity", "vyper")):
+        return SOLIDITY_DEFAULT_VULNERABILITIES.copy()
+
+    # 常见 Web/后端语言
+    if any(
+        keyword in language_text
+        for keyword in ("javascript", "typescript", "python", "php", "java", "go", "ruby", "c#", "node")
+    ):
+        return WEB_DEFAULT_VULNERABILITIES.copy()
+
+    # 无法识别语言时用通用逻辑安全集合作为保底
+    return GENERIC_DEFAULT_VULNERABILITIES.copy()
+
+
 # ============ Schemas ============
 
 class AgentTaskCreate(BaseModel):
@@ -58,8 +150,8 @@ class AgentTaskCreate(BaseModel):
     # 审计配置
     audit_scope: Optional[dict] = Field(None, description="审计范围")
     target_vulnerabilities: Optional[List[str]] = Field(
-        default=["sql_injection", "xss", "command_injection", "path_traversal", "ssrf"],
-        description="目标漏洞类型"
+        default=None,
+        description="目标漏洞类型（不传则按项目语言自动选择默认集合）"
     )
     verification_level: str = Field(
         "sandbox", 
@@ -1474,6 +1566,9 @@ async def _save_findings(
                 "secondary_verified": secondary_verified,
                 "primary_verified_only": primary_verified_only,
             }
+            pattern_name = finding.get("pattern_name")
+            if pattern_name:
+                finding_metadata["pattern_name"] = str(pattern_name)[:120]
             if location_text:
                 finding_metadata["raw_location"] = location_text[:500]
             if title_text:
@@ -1662,6 +1757,18 @@ async def create_agent_task(
     
     if project.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="无权访问此项目")
+
+    effective_target_vulnerabilities = (
+        request.target_vulnerabilities
+        if request.target_vulnerabilities
+        else _infer_default_target_vulnerabilities(project, request.target_files)
+    )
+    logger.info(
+        "[CreateAgentTask] project=%s languages=%s target_vulnerabilities=%s",
+        project.id,
+        _extract_project_languages(project),
+        effective_target_vulnerabilities,
+    )
     
     # 创建任务
     task = AgentTask(
@@ -1671,7 +1778,7 @@ async def create_agent_task(
         description=request.description,
         status=AgentTaskStatus.PENDING,
         current_phase=AgentTaskPhase.PLANNING,
-        target_vulnerabilities=request.target_vulnerabilities,
+        target_vulnerabilities=effective_target_vulnerabilities,
         verification_level=request.verification_level or "sandbox",
         branch_name=request.branch_name,  # 保存用户选择的分支
         exclude_patterns=request.exclude_patterns,

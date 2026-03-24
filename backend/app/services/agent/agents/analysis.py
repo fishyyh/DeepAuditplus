@@ -13,6 +13,7 @@ LLM 是真正的安全分析大脑！
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from ..json_parser import AgentJsonParser
 from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES
 
 logger = logging.getLogger(__name__)
+
+README_MISMATCH_PATTERN_NAME = "readme_code_behavior_mismatch"
 
 
 ANALYSIS_SYSTEM_PROMPT = """你是 DeepAudit 的漏洞分析 Agent，一个**自主**的安全专家。
@@ -321,7 +324,225 @@ class AnalysisAgent(BaseAgent):
         
         self._conversation_history: List[Dict[str, str]] = []
         self._steps: List[AnalysisStep] = []
-    
+
+    @staticmethod
+    def _normalize_language_text(values: List[Any]) -> str:
+        return " ".join(str(v).lower() for v in values if v is not None)
+
+    def _is_solidity_project(
+        self,
+        tech_stack: Dict[str, Any],
+        project_info: Dict[str, Any],
+        target_files: List[str],
+    ) -> bool:
+        """判断是否为 Solidity 项目。"""
+        tech_languages = tech_stack.get("languages", []) if isinstance(tech_stack, dict) else []
+        project_languages = project_info.get("languages", []) if isinstance(project_info, dict) else []
+        language_text = self._normalize_language_text([*tech_languages, *project_languages])
+
+        if "solidity" in language_text or "vyper" in language_text:
+            return True
+
+        return any(str(path).lower().endswith(".sol") for path in (target_files or []))
+
+    @staticmethod
+    def _safe_project_root(project_root: str) -> str:
+        root = os.path.realpath(project_root or ".")
+        return root if os.path.isdir(root) else "."
+
+    def _collect_readme_candidates(
+        self,
+        project_root: str,
+        target_files: Optional[List[str]] = None,
+        max_candidates: int = 6,
+    ) -> List[str]:
+        """收集 README 候选文件（绝对路径）。"""
+        root = self._safe_project_root(project_root)
+        target_files = target_files or []
+        candidates: List[str] = []
+        seen = set()
+
+        def add_candidate(path: str) -> None:
+            real = os.path.realpath(path)
+            if not real.startswith(root):
+                return
+            if not os.path.isfile(real):
+                return
+            key = real.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(real)
+
+        # 1) 从用户目标文件里优先找 README
+        for rel in target_files:
+            name = os.path.basename(str(rel)).lower()
+            if name.startswith("readme"):
+                add_candidate(os.path.join(root, str(rel)))
+                if len(candidates) >= max_candidates:
+                    return candidates
+
+        # 2) 常见 README 名称
+        common_names = [
+            "README.md",
+            "README.MD",
+            "readme.md",
+            "README_EN.md",
+            "README_ZH.md",
+            "README_CN.md",
+            "README.txt",
+            "docs/README.md",
+        ]
+        for rel in common_names:
+            add_candidate(os.path.join(root, rel))
+            if len(candidates) >= max_candidates:
+                return candidates
+
+        # 3) 顶层与 docs 下兜底搜索（限制深度）
+        skip_dirs = {".git", "node_modules", "vendor", "lib", "dist", "build", "artifacts", "cache", "out"}
+        for current_root, dirs, files in os.walk(root):
+            rel_depth = os.path.relpath(current_root, root).count(os.sep)
+            if rel_depth > 2:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for filename in files:
+                lower = filename.lower()
+                if lower.startswith("readme") and lower.endswith((".md", ".txt")):
+                    add_candidate(os.path.join(current_root, filename))
+                    if len(candidates) >= max_candidates:
+                        return candidates
+
+        return candidates
+
+    @staticmethod
+    def _read_text_file(path: str, max_chars: int = 12000) -> str:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read(max_chars)
+        except Exception:
+            return ""
+
+    def _extract_business_logic_points(self, markdown_text: str, max_points: int = 18) -> List[str]:
+        """从 README 提取业务逻辑关键信息（启发式）。"""
+        if not markdown_text:
+            return []
+
+        lines = [line.strip() for line in markdown_text.splitlines() if line.strip()]
+        if not lines:
+            return []
+
+        keywords = (
+            "protocol", "architecture", "mechanism", "workflow", "logic", "business",
+            "token", "tokenomics", "vault", "pool", "swap", "router", "hook",
+            "deposit", "withdraw", "redeem", "mint", "burn", "stake", "unstake",
+            "collateral", "liquidation", "oracle", "fee", "reward", "governance",
+            "phase", "limit", "cooldown", "risk", "flash", "loan", "upgrade",
+            "业务", "机制", "逻辑", "架构", "流程", "代币", "池", "存款", "取款", "赎回",
+            "铸造", "销毁", "质押", "清算", "预言机", "费率", "奖励", "治理", "风控", "升级",
+        )
+
+        points: List[str] = []
+        seen = set()
+        for raw in lines:
+            if raw.startswith("```") or raw.startswith("|---"):
+                continue
+            normalized = re.sub(r"^[#>\-\*\d\.\)\s]+", "", raw).strip()
+            if len(normalized) < 8:
+                continue
+            lower = normalized.lower()
+            if any(k in lower for k in keywords):
+                if normalized not in seen:
+                    seen.add(normalized)
+                    points.append(normalized)
+                if len(points) >= max_points:
+                    break
+
+        # 兜底：关键词过少时补充前几条二级标题
+        if len(points) < 6:
+            for raw in lines:
+                if not raw.startswith("##"):
+                    continue
+                normalized = re.sub(r"^[#\s]+", "", raw).strip()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    points.append(normalized)
+                if len(points) >= max_points:
+                    break
+
+        return points[:max_points]
+
+    def _build_solidity_readme_context(
+        self,
+        project_root: str,
+        target_files: Optional[List[str]] = None,
+    ) -> str:
+        """构建 Solidity 项目的 README 业务逻辑上下文摘要。"""
+        candidates = self._collect_readme_candidates(project_root, target_files=target_files)
+        if not candidates:
+            return ""
+
+        sections: List[str] = []
+        for path in candidates[:3]:
+            content = self._read_text_file(path)
+            if not content:
+                continue
+            points = self._extract_business_logic_points(content)
+            if not points:
+                continue
+            rel = os.path.relpath(path, self._safe_project_root(project_root))
+            bullet_text = "\n".join(f"- {point}" for point in points[:10])
+            sections.append(f"### 来源: {rel}\n{bullet_text}")
+
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _is_readme_behavior_mismatch_finding(finding: Dict[str, Any]) -> bool:
+        """判断发现是否属于 README/文档 与代码行为不一致。"""
+        text_fields = [
+            finding.get("title", ""),
+            finding.get("description", ""),
+            finding.get("context", ""),
+            finding.get("summary", ""),
+            finding.get("suggestion", ""),
+        ]
+        blob = " ".join(str(x).lower() for x in text_fields if x)
+        if not blob:
+            return False
+
+        # 中英文关键词混合匹配，覆盖常见表达
+        has_readme_or_doc = any(
+            marker in blob
+            for marker in (
+                "readme",
+                "documentation",
+                "documented",
+                "spec",
+                "specification",
+                "文档",
+                "说明",
+                "规格",
+                "白皮书",
+            )
+        )
+        has_mismatch = any(
+            marker in blob
+            for marker in (
+                "mismatch",
+                "inconsistent",
+                "not aligned",
+                "deviate",
+                "differs from",
+                "does not match",
+                "不一致",
+                "不匹配",
+                "偏离",
+                "与代码行为不符",
+                "与实现不一致",
+            )
+        )
+        return has_readme_or_doc and has_mismatch
+
 
     
     def _parse_llm_response(self, response: str) -> AnalysisStep:
@@ -553,13 +774,36 @@ class AnalysisAgent(BaseAgent):
         
         # 🔥 获取目标文件列表
         target_files = config.get("target_files", [])
-        
+        project_root = input_data.get("project_root", project_info.get("root", "."))
+        is_solidity = self._is_solidity_project(tech_stack, project_info, target_files)
+        solidity_readme_context = ""
+        if is_solidity:
+            solidity_readme_context = self._build_solidity_readme_context(project_root, target_files=target_files)
+            if solidity_readme_context:
+                self.add_insight("已从 README 提取 Solidity 业务逻辑上下文，用于业务逻辑漏洞审计")
+                await self.emit_event("info", "📘 已自动读取 README，并提炼 Solidity 业务逻辑上下文")
+            else:
+                await self.emit_event("info", "📘 未找到可用 README 业务上下文，将按代码行为继续业务逻辑审计")
+
         initial_message = f"""请开始对项目进行安全漏洞分析。
 
 ## 项目信息
 - 名称: {project_info.get('name', 'unknown')}
 - 语言: {tech_stack.get('languages', [])}
 - 框架: {tech_stack.get('frameworks', [])}
+
+"""
+        if is_solidity:
+            if solidity_readme_context:
+                initial_message += f"""## 🧭 Solidity 业务逻辑上下文（自动提取自 README）
+{solidity_readme_context}
+
+请将以上信息作为业务审计输入，重点核对代码与 README 声明是否一致；若出现明显偏差，请按 business_logic 漏洞报告并给出影响路径。
+
+"""
+            else:
+                initial_message += """## 🧭 Solidity 业务逻辑审计要求
+当前未提取到 README 业务上下文。请优先读取项目 README/文档文件，再结合代码进行业务逻辑漏洞审计（资金流、状态机、权限边界、不变量）。
 
 """
         # 🔥 如果指定了目标文件，明确告知 Agent
@@ -942,7 +1186,11 @@ Final Answer:""",
                     "suggestion": finding.get("suggestion", ""),
                     "confidence": finding.get("confidence", 0.7),
                     "needs_verification": finding.get("needs_verification", True),
+                    "pattern_name": finding.get("pattern_name"),
                 }
+
+                if not standardized.get("pattern_name") and self._is_readme_behavior_mismatch_finding(finding):
+                    standardized["pattern_name"] = README_MISMATCH_PATTERN_NAME
 
                 # 高危业务逻辑漏洞必须进入二次验证阶段（即使上游误设为 False）
                 vuln_type = str(standardized.get("vulnerability_type", "")).lower()
