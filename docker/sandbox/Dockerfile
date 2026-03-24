@@ -2,17 +2,14 @@
 # 安全沙箱环境用于漏洞验证和 PoC 执行
 # 集成各类安全扫描工具 (Semgrep, Bandit, Gitleaks, etc.)
 
-FROM docker.m.daocloud.io/python:3.11-bullseye
+FROM python:3.11-bullseye
 
 LABEL maintainer="XCodeReviewer Team"
 LABEL description="Secure sandbox environment for vulnerability verification and security scanning"
 
 # 安装基本工具
 # 安装基本工具
-# 使用阿里云镜像加速 apt
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
-    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list && \
-    sed -i 's/security.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list && \
     apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
@@ -33,35 +30,31 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装 Node.js (用于 JavaScript/TypeScript 代码执行 和 npm audit)
-# 使用淘宝/阿里云镜像加速
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && npm config set registry https://registry.npmmirror.com \
+    && npm config set registry https://registry.npmjs.org \
     && (npm install -g hardhat truffle --silent || true) \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 Go (使用阿里云镜像)
+# 安装 Go
 ENV PATH=$PATH:/usr/local/go/bin
-ENV GOPROXY=https://goproxy.cn,direct
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
-    curl -L https://mirrors.aliyun.com/golang/go1.21.6.linux-amd64.tar.gz -o go.tar.gz && \
+    curl -L https://go.dev/dl/go1.21.6.linux-amd64.tar.gz -o go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && \
     rm go.tar.gz
 
-# 安装 Rust (使用 rsproxy 镜像)
+# 安装 Rust
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH \
-    RUSTUP_DIST_SERVER=https://rsproxy.cn \
-    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+    PATH=/usr/local/cargo/bin:$PATH
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
-    curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y --default-toolchain stable --profile minimal && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal && \
     chmod -R a+w /usr/local/cargo
 
 # 安装 Python 安全工具
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
-    pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    pip install --no-cache-dir --retries 8 --timeout 120 \
     requests \
     httpx \
     aiohttp \
@@ -78,7 +71,7 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
 
 # 安装 Solidity 安全工具（主力静态分析 + 符号执行）
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
-    pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    pip install --no-cache-dir --retries 8 --timeout 120 \
     slither-analyzer \
     mythril \
     solc-select
