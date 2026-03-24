@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 # 配置常量
-MAX_TOTAL_TOKENS = 100_000  # 最大总token数
+MAX_TOTAL_TOKENS = 60_000   # 最大总token数（更早触发压缩以降低成本）
 MIN_RECENT_MESSAGES = 15    # 最少保留的最近消息数
-COMPRESSION_THRESHOLD = 0.9  # 触发压缩的阈值（90%）
+COMPRESSION_THRESHOLD = 0.8  # 触发压缩的阈值（80%）
 
 
 def estimate_tokens(text: str, model: str = "gpt-4") -> int:

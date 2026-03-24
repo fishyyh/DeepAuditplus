@@ -589,7 +589,7 @@ Final Answer: [JSON格式的结果]"""
                     # 添加观察结果到历史
                     self._conversation_history.append({
                         "role": "user",
-                        "content": f"Observation:\n{observation}",
+                        "content": self.format_observation_for_history(observation),
                     })
                     if rag_auth_failed:
                         self._conversation_history.append({

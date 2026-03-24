@@ -422,7 +422,7 @@ Action Input: {{"参数": "值"}}
                 # 添加观察结果到历史
                 self._conversation_history.append({
                     "role": "user",
-                    "content": f"Observation:\n{step.observation}",
+                    "content": self.format_observation_for_history(step.observation or ""),
                 })
             
             # 生成最终结果

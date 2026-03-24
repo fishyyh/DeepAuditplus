@@ -495,9 +495,13 @@ class VerificationAgent(BaseAgent):
                         if isinstance(f, dict):
                             # 🔥 Always verify Critical/High findings to generate PoC, even if Analysis sets needs_verification=False
                             severity = str(f.get("severity", "")).lower()
+                            vuln_type = str(f.get("vulnerability_type", "")).lower()
                             needs_verify = f.get("needs_verification", True)
-                            
-                            if needs_verify or severity in ["critical", "high"]:
+
+                            must_verify_business_logic = (
+                                vuln_type == "business_logic" and severity in ["critical", "high"]
+                            )
+                            if needs_verify or severity in ["critical", "high"] or must_verify_business_logic:
                                 findings_to_verify.append(f)
                     logger.info(f"[Verification] 从 previous_results.findings 获取 {len(findings_to_verify)} 个发现")
             
@@ -517,9 +521,13 @@ class VerificationAgent(BaseAgent):
                         for f in phase_findings:
                             if isinstance(f, dict):
                                 severity = str(f.get("severity", "")).lower()
+                                vuln_type = str(f.get("vulnerability_type", "")).lower()
                                 needs_verify = f.get("needs_verification", True)
-                                
-                                if needs_verify or severity in ["critical", "high"]:
+
+                                must_verify_business_logic = (
+                                    vuln_type == "business_logic" and severity in ["critical", "high"]
+                                )
+                                if needs_verify or severity in ["critical", "high"] or must_verify_business_logic:
                                     findings_to_verify.append(f)
                 
                 if findings_to_verify:
@@ -756,7 +764,7 @@ class VerificationAgent(BaseAgent):
                         await self.emit_llm_observation(observation)
                         self._conversation_history.append({
                             "role": "user",
-                            "content": f"Observation:\n{observation}",
+                            "content": self.format_observation_for_history(observation),
                         })
                         continue
 
@@ -811,7 +819,7 @@ class VerificationAgent(BaseAgent):
                     # 添加观察结果到历史
                     self._conversation_history.append({
                         "role": "user",
-                        "content": f"Observation:\n{observation}",
+                        "content": self.format_observation_for_history(observation),
                     })
                 else:
                     # LLM 没有选择工具，提示它继续

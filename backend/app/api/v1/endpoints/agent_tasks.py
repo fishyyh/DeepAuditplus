@@ -1401,6 +1401,21 @@ async def _save_findings(
                 # 缺少关键定位信息时，不应视为已验证
                 is_verified = False
 
+            raw_verification_result = finding.get("verification_result")
+            secondary_verified = bool(finding.get("secondary_verified"))
+            if isinstance(raw_verification_result, dict):
+                secondary_verified = secondary_verified or bool(raw_verification_result.get("secondary_verified"))
+
+            # 合约业务逻辑高危发现：强制要求二次验证（未验证前标记为 needs_review）
+            requires_secondary_verification = (
+                type_enum == VulnerabilityType.BUSINESS_LOGIC
+                and severity_enum in {VulnerabilitySeverity.CRITICAL, VulnerabilitySeverity.HIGH}
+            )
+            primary_verified_only = False
+            if requires_secondary_verification and not secondary_verified and is_verified:
+                primary_verified_only = True
+                is_verified = False
+
             # 🔥 Handle PoC information
             poc_data = finding.get("poc", {})
             has_poc = bool(poc_data)
@@ -1417,14 +1432,31 @@ async def _save_findings(
 
             # 🔥 Handle verification details
             verification_method = finding.get("verification_method")
-            verification_result = None
+            verification_result = raw_verification_result if isinstance(raw_verification_result, dict) else None
             if finding.get("verification_details"):
-                verification_result = {"details": finding.get("verification_details")}
+                if verification_result is None:
+                    verification_result = {}
+                verification_result["details"] = finding.get("verification_details")
             if manual_locate_reasons:
                 verification_method = verification_method or "manual_locate_required"
                 if verification_result is None:
                     verification_result = {}
                 verification_result["manual_locate_reasons"] = manual_locate_reasons
+
+            if primary_verified_only:
+                if verification_result is None:
+                    verification_result = {}
+                verification_result["primary_verification_passed"] = True
+                verification_result["primary_verification_note"] = "初步验证通过，等待二次业务逻辑验证"
+
+            if requires_secondary_verification and not secondary_verified:
+                verification_method = verification_method or "secondary_business_logic_verification_required"
+                if verification_result is None:
+                    verification_result = {}
+                verification_result["secondary_verification_required"] = True
+                verification_result["secondary_verification_reason"] = (
+                    "高危业务逻辑漏洞必须经过二次验证（如 PoC/状态机回放/不变量测试）"
+                )
 
             # 🔥 Handle CWE and CVSS
             cwe_id = finding.get("cwe_id") or finding.get("cwe")
@@ -1438,11 +1470,20 @@ async def _save_findings(
             finding_metadata = {
                 "manual_locate_required": bool(manual_locate_reasons),
                 "manual_locate_reasons": manual_locate_reasons,
+                "requires_secondary_verification": requires_secondary_verification,
+                "secondary_verified": secondary_verified,
+                "primary_verified_only": primary_verified_only,
             }
             if location_text:
                 finding_metadata["raw_location"] = location_text[:500]
             if title_text:
                 finding_metadata["raw_title"] = title_text[:500]
+
+            status_value = FindingStatus.NEW
+            if manual_locate_reasons or (requires_secondary_verification and not secondary_verified):
+                status_value = FindingStatus.NEEDS_REVIEW
+            elif is_verified:
+                status_value = FindingStatus.VERIFIED
 
             db_finding = AgentFinding(
                 id=str(uuid4()),
@@ -1458,7 +1499,7 @@ async def _save_findings(
                 suggestion=suggestion[:5000] if suggestion else None,
                 is_verified=is_verified,
                 ai_confidence=confidence,  # 🔥 FIX: Use ai_confidence, not confidence
-                status=FindingStatus.NEEDS_REVIEW if manual_locate_reasons else (FindingStatus.VERIFIED if is_verified else FindingStatus.NEW),
+                status=status_value,
                 # 🔥 Additional fields
                 has_poc=has_poc,
                 poc_code=poc_code,

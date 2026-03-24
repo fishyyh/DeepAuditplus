@@ -29,7 +29,7 @@ class SmartScanInput(BaseModel):
     )
     scan_types: Optional[List[str]] = Field(
         default=None,
-        description="扫描类型列表。可选: pattern, secret, dependency, all。默认为 all"
+        description="扫描类型列表。可选: pattern, secret, dependency, consistency, all。默认为 all"
     )
     focus_vulnerabilities: Optional[List[str]] = Field(
         default=None,
@@ -188,6 +188,7 @@ class SmartScanTool(AgentTool):
 扫描类型:
 - pattern: 危险代码模式匹配
 - secret: 密钥泄露检测
+- consistency: 跨文件一致性检查（部署脚本 vs 合约实现，重点 Solidity）
 - all: 所有类型（默认）
 
 输出：按风险级别分类的发现汇总，可直接用于制定进一步分析策略。"""
@@ -227,6 +228,16 @@ class SmartScanTool(AgentTool):
             if file_findings:
                 all_findings.extend(file_findings)
                 files_with_issues.add(file_path)
+
+        # Solidity 业务逻辑增强：跨文件一致性检查（部署脚本 vs 合约实现）
+        if self._should_run_consistency_scan(scan_types, focus_vulnerabilities):
+            consistency_findings = await self._scan_solidity_consistency(target)
+            if consistency_findings:
+                all_findings.extend(consistency_findings)
+                for finding in consistency_findings:
+                    file_path = finding.get("file_path")
+                    if file_path:
+                        files_with_issues.add(file_path)
         
         # 生成报告
         return self._generate_report(
@@ -235,6 +246,323 @@ class SmartScanTool(AgentTool):
             all_findings,
             quick_mode
         )
+
+    def _should_run_consistency_scan(
+        self,
+        scan_types: Optional[List[str]],
+        focus_vulnerabilities: Optional[List[str]],
+    ) -> bool:
+        """判断是否执行 Solidity 跨文件一致性扫描。"""
+        selected_scan_types = set(scan_types or ["all"])
+        if "all" not in selected_scan_types and "consistency" not in selected_scan_types:
+            return False
+
+        if not focus_vulnerabilities:
+            return True
+
+        focus_set = {v.lower() for v in focus_vulnerabilities}
+        return bool(
+            {"business_logic", "auth_bypass", "race_condition", "code_injection"} & focus_set
+        )
+
+    def _collect_solidity_context_files(self, target: str, max_files: int = 220) -> List[str]:
+        """
+        收集 Solidity 业务逻辑扫描上下文文件（合约 + 部署脚本）。
+        返回相对 project_root 的路径。
+        """
+        full_target = os.path.join(self.project_root, target)
+        if not os.path.exists(full_target):
+            full_target = self.project_root
+
+        skip_dirs = {
+            ".git", "node_modules", "vendor", "lib", "artifacts", "cache",
+            "dist", "build", "out", ".next", ".turbo"
+        }
+        candidates: List[str] = []
+
+        for root, dirs, files in os.walk(full_target):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for filename in files:
+                lower_name = filename.lower()
+                rel_path = os.path.relpath(os.path.join(root, filename), self.project_root)
+                if lower_name.endswith(".sol"):
+                    candidates.append(rel_path)
+                elif (
+                    lower_name.endswith((".s.sol", ".js", ".ts", ".py"))
+                    and ("deploy" in lower_name or "script" in rel_path.lower())
+                ):
+                    candidates.append(rel_path)
+
+                if len(candidates) >= max_files:
+                    return candidates
+
+        return candidates
+
+    @staticmethod
+    def _line_no(content: str, marker: str) -> int:
+        """根据子串定位近似行号。"""
+        idx = content.find(marker)
+        if idx < 0:
+            return 0
+        return content[:idx].count("\n") + 1
+
+    @staticmethod
+    def _line_no_by_regex(content: str, pattern: str) -> int:
+        """根据正则定位近似行号。"""
+        match = re.search(pattern, content, re.IGNORECASE | re.MULTILINE)
+        if not match:
+            return 0
+        return content[:match.start()].count("\n") + 1
+
+    @staticmethod
+    def _line_text(content: str, line_number: int) -> str:
+        """获取指定行文本，用于报告展示。"""
+        if line_number <= 0:
+            return ""
+        lines = content.split("\n")
+        if line_number > len(lines):
+            return ""
+        return lines[line_number - 1].strip()[:220]
+
+    def _best_line_no(
+        self,
+        content: str,
+        markers: Optional[List[str]] = None,
+        regex_patterns: Optional[List[str]] = None,
+    ) -> int:
+        """优先按 marker 定位，再按 regex 定位。"""
+        for marker in markers or []:
+            line_no = self._line_no(content, marker)
+            if line_no > 0:
+                return line_no
+
+        for pattern in regex_patterns or []:
+            line_no = self._line_no_by_regex(content, pattern)
+            if line_no > 0:
+                return line_no
+
+        return 1
+
+    def _build_consistency_finding(
+        self,
+        file_path: str,
+        content: str,
+        pattern_name: str,
+        summary: str,
+        context: str,
+        severity: str,
+        markers: Optional[List[str]] = None,
+        regex_patterns: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """统一构建 Solidity 一致性扫描发现，确保包含可定位代码行。"""
+        line_number = self._best_line_no(content, markers=markers, regex_patterns=regex_patterns)
+        line_text = self._line_text(content, line_number)
+        return {
+            "vulnerability_type": "business_logic",
+            "pattern_name": pattern_name,
+            "file_path": file_path,
+            "line_number": line_number,
+            "matched_line": line_text or summary,
+            "summary": summary,
+            "context": context,
+            "severity": severity,
+            "code_snippet": line_text or None,
+        }
+
+    async def _scan_solidity_consistency(self, target: str) -> List[Dict[str, Any]]:
+        """
+        Solidity 合约业务逻辑跨文件一致性扫描。
+        聚焦部署脚本/Hook 配置/记账口径等高价值逻辑问题。
+        """
+        findings: List[Dict[str, Any]] = []
+        seen_keys = set()
+
+        def add_finding(finding: Dict[str, Any]) -> None:
+            key = (
+                finding.get("pattern_name"),
+                finding.get("file_path"),
+                finding.get("line_number"),
+            )
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            findings.append(finding)
+
+        files = self._collect_solidity_context_files(target)
+        if not files:
+            return findings
+
+        contents: Dict[str, str] = {}
+        for rel_path in files:
+            full_path = os.path.join(self.project_root, rel_path)
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                    contents[rel_path] = f.read()
+            except Exception:
+                continue
+
+        script_files = [
+            p for p in contents
+            if p.lower().endswith((".s.sol", ".js", ".ts", ".py"))
+            and ("deploy" in p.lower() or "script" in p.lower())
+        ]
+        contract_files = [p for p in contents if p.lower().endswith(".sol")]
+
+        # 规则1：beforeSwap 直接用 sender 做用户统计（router 身份误用）
+        for path in contract_files:
+            text = contents[path]
+            if (
+                re.search(r"function\s+_?beforeSwap\s*\(\s*address\s+sender", text, re.IGNORECASE)
+                and (
+                    re.search(r"addressSwappedAmount\s*\[\s*sender\s*\]\s*\+?=", text)
+                    or re.search(r"addressLastSwapBlock\s*\[\s*sender\s*\]\s*=", text)
+                )
+            ):
+                add_finding(
+                    self._build_consistency_finding(
+                        file_path=path,
+                        content=text,
+                        pattern_name="router_sender_identity_misuse",
+                        summary="beforeSwap 中使用 sender 直接记账，可能把 router 当成真实用户",
+                        context="建议核查 sender 语义并按真实用户维度统计风控状态。",
+                        severity="critical",
+                        regex_patterns=[
+                            r"addressSwappedAmount\s*\[\s*sender\s*\]\s*\+?=",
+                            r"addressLastSwapBlock\s*\[\s*sender\s*\]\s*=",
+                        ],
+                    )
+                )
+
+        # 规则2：phase 重置仅清空 address(0)
+        for path in contract_files:
+            text = contents[path]
+            if (
+                re.search(r"function\s+_?resetPerAddressTracking\s*\(", text, re.IGNORECASE)
+                and re.search(r"address\s*\(\s*0\s*\)", text)
+            ):
+                add_finding(
+                    self._build_consistency_finding(
+                        file_path=path,
+                        content=text,
+                        pattern_name="phase_reset_only_zero_address",
+                        summary="阶段重置逻辑仅重置 address(0)，真实用户状态可能未清理",
+                        context="建议改为 phase 分桶统计或按用户懒重置。",
+                        severity="high",
+                        regex_patterns=[r"address\s*\(\s*0\s*\)"],
+                    )
+                )
+
+        # 规则3：全局状态疑似未按 PoolId 隔离
+        for path in contract_files:
+            text = contents[path]
+            has_global_phase_state = bool(
+                re.search(r"\b(currentPhase|launchStartBlock|lastPhaseUpdateBlock|initialLiquidity)\b", text)
+            )
+            has_after_init = bool(re.search(r"function\s+_?afterInitialize\s*\(", text))
+            writes_global = bool(
+                re.search(r"(currentPhase|launchStartBlock|lastPhaseUpdateBlock|initialLiquidity)\s*=", text)
+            )
+            has_per_pool_state = bool(re.search(r"mapping\s*\(\s*PoolId\s*=>", text))
+
+            if has_global_phase_state and has_after_init and writes_global and not has_per_pool_state:
+                add_finding(
+                    self._build_consistency_finding(
+                        file_path=path,
+                        content=text,
+                        pattern_name="pool_state_not_isolated",
+                        summary="Hook 生命周期状态疑似全局共享，可能存在跨池状态污染",
+                        context="建议将阶段/流动性/用户统计改为 PoolId 作用域。",
+                        severity="critical",
+                        regex_patterns=[r"(currentPhase|launchStartBlock|lastPhaseUpdateBlock|initialLiquidity)\s*="],
+                    )
+                )
+
+        # 规则4：Hook 权限位脚本与合约声明不一致（BEFORE/AFTER_INITIALIZE）
+        contract_after_init_true = False
+        contract_before_init_true = False
+        for path in contract_files:
+            text = contents[path]
+            if re.search(r"function\s+getHookPermissions\s*\(", text):
+                if re.search(r"afterInitialize\s*:\s*true", text):
+                    contract_after_init_true = True
+                if re.search(r"beforeInitialize\s*:\s*true", text):
+                    contract_before_init_true = True
+
+        for path in script_files:
+            text = contents[path]
+            has_before_flag = "Hooks.BEFORE_INITIALIZE_FLAG" in text
+            has_after_flag = "Hooks.AFTER_INITIALIZE_FLAG" in text
+            mismatch = (
+                (contract_after_init_true and has_before_flag and not has_after_flag)
+                or (contract_before_init_true and has_after_flag and not has_before_flag)
+            )
+            if mismatch:
+                add_finding(
+                    self._build_consistency_finding(
+                        file_path=path,
+                        content=text,
+                        pattern_name="hook_permission_flag_mismatch",
+                        summary="部署脚本 Hook flags 与合约 getHookPermissions 声明疑似不一致",
+                        context="建议统一 BEFORE/AFTER_INITIALIZE 权限位来源并在部署前断言一致。",
+                        severity="high",
+                        regex_patterns=[r"Hooks\.(BEFORE|AFTER)_INITIALIZE_FLAG"],
+                    )
+                )
+
+        # 规则5：HookMiner deployer 参数疑似错配 / 常量未定义
+        for path in script_files:
+            text = contents[path]
+            has_hookminer = "HookMiner.find(" in text
+            has_factory_arg = bool(re.search(r"HookMiner\.find\s*\(\s*CREATE2_FACTORY", text))
+            has_start_broadcast = "startBroadcast" in text
+            has_salt_deploy = bool(re.search(r"new\s+\w+\s*\{\s*salt\s*:", text))
+            create2_factory_commented = bool(re.search(r"//\s*address\s+constant\s+CREATE2_FACTORY", text))
+
+            if has_hookminer and has_factory_arg and has_start_broadcast and has_salt_deploy:
+                add_finding(
+                    self._build_consistency_finding(
+                        file_path=path,
+                        content=text,
+                        pattern_name="hookminer_deployer_mismatch",
+                        summary="HookMiner 挖矿地址与实际部署者可能不一致，存在地址错配风险",
+                        context="建议使用实际 deployer 地址参与挖矿并校验 address(hook)==mined。",
+                        severity="medium",
+                        regex_patterns=[r"HookMiner\.find\s*\("],
+                    )
+                )
+            if has_hookminer and create2_factory_commented and has_factory_arg:
+                add_finding(
+                    self._build_consistency_finding(
+                        file_path=path,
+                        content=text,
+                        pattern_name="undefined_create2_factory_constant",
+                        summary="CREATE2_FACTORY 疑似注释/未定义但仍被引用",
+                        context="建议修复常量定义并保证脚本可编译、可复现部署地址。",
+                        severity="medium",
+                        regex_patterns=[r"CREATE2_FACTORY"],
+                    )
+                )
+
+        # 规则6：amountSpecified 绝对值统一记账，疑似 exact in/out 口径错误
+        abs_amount_pattern = (
+            r"amountSpecified\s*<\s*0\s*\?\s*uint256\s*\(\s*-\s*params\.amountSpecified\s*\)\s*:\s*uint256\s*\(\s*params\.amountSpecified\s*\)"
+        )
+        for path in contract_files:
+            text = contents[path]
+            if re.search(abs_amount_pattern, text):
+                add_finding(
+                    self._build_consistency_finding(
+                        file_path=path,
+                        content=text,
+                        pattern_name="swap_amount_accounting_mismatch",
+                        summary="swapAmount 对 amountSpecified 正负统一绝对值，疑似 exact in/out 记账偏差",
+                        context="建议基于 afterSwap BalanceDelta 按方向记账，避免误触发限额/惩罚。",
+                        severity="high",
+                        regex_patterns=[abs_amount_pattern],
+                    )
+                )
+
+        return findings
     
     async def _collect_files(
         self, 

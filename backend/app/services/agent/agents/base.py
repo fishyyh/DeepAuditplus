@@ -926,7 +926,7 @@ class BaseAgent(ABC):
     def compress_messages_if_needed(
         self,
         messages: List[Dict[str, str]],
-        max_tokens: int = 100000,
+        max_tokens: int = 60000,
     ) -> List[Dict[str, str]]:
         """
         如果消息历史过长，自动压缩
@@ -949,6 +949,41 @@ class BaseAgent(ABC):
             return compressed
         
         return messages
+
+    def format_observation_for_history(
+        self,
+        observation: str,
+        max_chars: int = 4000,
+    ) -> str:
+        """
+        格式化 Observation，避免超长工具输出直接灌入上下文导致 token 暴涨。
+
+        Args:
+            observation: 原始观察结果
+            max_chars: 最大保留字符数
+
+        Returns:
+            用于对话历史的 Observation 文本
+        """
+        if not observation:
+            return "Observation:\n[empty]"
+
+        text = observation.strip()
+        if len(text) <= max_chars:
+            return f"Observation:\n{text}"
+
+        # 保留头尾关键信息，中间截断，兼顾可读性与 token 成本
+        kept = max_chars
+        head_len = int(kept * 0.75)
+        tail_len = max(200, kept - head_len)
+        omitted = max(0, len(text) - head_len - tail_len)
+
+        compact = (
+            f"{text[:head_len]}\n\n"
+            f"...[已截断 {omitted} 字符，完整输出请查看工具结果日志]...\n\n"
+            f"{text[-tail_len:]}"
+        )
+        return f"Observation:\n{compact}"
     
     # ============ 统一的流式 LLM 调用 ============
 

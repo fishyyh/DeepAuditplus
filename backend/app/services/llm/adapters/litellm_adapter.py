@@ -315,11 +315,29 @@ class LiteLLMAdapter(BaseLLMAdapter):
         litellm.drop_params = True
 
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        cache_enabled = False
 
         # 🔥 估算输入 token 数量（用于在无法获取真实 usage 时进行估算）
         input_tokens_estimate = sum(
             estimate_tokens(msg["content"], self.config.model) for msg in messages
         )
+
+        # 🔥 Prompt Caching: 流式调用链也应用缓存（与非流式保持一致）
+        if self.config.provider == LLMProvider.CLAUDE:
+            system_tokens = 0
+            for msg in messages:
+                if msg.get("role") == "system":
+                    system_tokens += estimate_tokens(msg.get("content", ""))
+
+            messages, cache_enabled = prompt_cache_manager.process_messages(
+                messages=messages,
+                model=self.config.model,
+                provider=self.config.provider.value,
+                system_prompt_tokens=system_tokens,
+            )
+
+            if cache_enabled:
+                logger.debug(f"🔥 Prompt Caching enabled for stream call: {self.config.model}")
 
         kwargs = {
             "model": self._litellm_model,
@@ -348,6 +366,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
         accumulated_content = ""
         final_usage = None  # 🔥 存储最终的 usage 信息
+        final_usage_obj = None  # 保留原始 usage 对象，供缓存统计读取
         chunk_count = 0  # 🔥 跟踪 chunk 数量
 
         try:
@@ -358,6 +377,7 @@ class LiteLLMAdapter(BaseLLMAdapter):
 
                 # 🔥 检查是否有 usage 信息（某些 API 会在最后的 chunk 中包含）
                 if hasattr(chunk, "usage") and chunk.usage:
+                    final_usage_obj = chunk.usage
                     final_usage = {
                         "prompt_tokens": chunk.usage.prompt_tokens or 0,
                         "completion_tokens": chunk.usage.completion_tokens or 0,
@@ -401,6 +421,14 @@ class LiteLLMAdapter(BaseLLMAdapter):
                     if not accumulated_content:
                         logger.warning(f"Stream completed with no content after {chunk_count} chunks, finish_reason={finish_reason}")
 
+                    # 🔥 更新 Prompt Cache 统计（流式）
+                    if cache_enabled and final_usage_obj is not None:
+                        prompt_cache_manager.update_stats(
+                            cache_creation_input_tokens=getattr(final_usage_obj, "cache_creation_input_tokens", 0),
+                            cache_read_input_tokens=getattr(final_usage_obj, "cache_read_input_tokens", 0),
+                            total_input_tokens=final_usage.get("prompt_tokens", 0) if final_usage else 0,
+                        )
+
                     yield {
                         "type": "done",
                         "content": accumulated_content,
@@ -421,6 +449,13 @@ class LiteLLMAdapter(BaseLLMAdapter):
                         "completion_tokens": output_tokens_estimate,
                         "total_tokens": input_tokens_estimate + output_tokens_estimate,
                     }
+
+                if cache_enabled and final_usage_obj is not None:
+                    prompt_cache_manager.update_stats(
+                        cache_creation_input_tokens=getattr(final_usage_obj, "cache_creation_input_tokens", 0),
+                        cache_read_input_tokens=getattr(final_usage_obj, "cache_read_input_tokens", 0),
+                        total_input_tokens=final_usage.get("prompt_tokens", 0) if final_usage else 0,
+                    )
                 yield {
                     "type": "done",
                     "content": accumulated_content,

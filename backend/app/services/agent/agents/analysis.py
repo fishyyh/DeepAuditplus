@@ -816,7 +816,7 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     # 添加观察结果到历史
                     self._conversation_history.append({
                         "role": "user",
-                        "content": f"Observation:\n{observation}",
+                        "content": self.format_observation_for_history(observation),
                     })
                     if rag_auth_failed:
                         self._conversation_history.append({
@@ -943,6 +943,14 @@ Final Answer:""",
                     "confidence": finding.get("confidence", 0.7),
                     "needs_verification": finding.get("needs_verification", True),
                 }
+
+                # 高危业务逻辑漏洞必须进入二次验证阶段（即使上游误设为 False）
+                vuln_type = str(standardized.get("vulnerability_type", "")).lower()
+                severity = str(standardized.get("severity", "")).lower()
+                if vuln_type == "business_logic" and severity in {"critical", "high"}:
+                    standardized["needs_verification"] = True
+                    standardized["verification_priority"] = "mandatory_secondary"
+
                 standardized_findings.append(standardized)
             
             await self.emit_event(
