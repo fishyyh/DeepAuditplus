@@ -73,8 +73,10 @@ RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
     pip install --no-cache-dir --retries 8 --timeout 120 \
     slither-analyzer \
-    mythril \
-    solc-select
+    solc-select && \
+    (pip install --no-cache-dir --retries 8 --timeout 120 mythril==0.24.8 || \
+     pip install --no-cache-dir --retries 8 --timeout 120 mythril || \
+     echo "WARNING: mythril install failed, continue with slither only")
 
 # 预装常用 solc 版本，提升 Solidity 扫描稳定性
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
