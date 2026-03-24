@@ -543,6 +543,84 @@ class AnalysisAgent(BaseAgent):
         )
         return has_readme_or_doc and has_mismatch
 
+    @staticmethod
+    def _should_suppress_external_address_noise(finding: Dict[str, Any]) -> bool:
+        """
+        抑制 Solidity 常见误报：
+        脚本里硬编码 Permit2/token0/token1 等外部地址，不应按密钥泄露/敏感数据直接报漏洞。
+        """
+        vuln_type = str(finding.get("vulnerability_type", "")).lower()
+        pattern_name = str(finding.get("pattern_name", "")).lower()
+
+        related_to_secret_rule = (
+            vuln_type in {"hardcoded_secret", "sensitive_data_exposure"}
+            or "硬编码密钥" in pattern_name
+            or "sensitive" in pattern_name
+        )
+        if not related_to_secret_rule:
+            return False
+
+        file_path = str(finding.get("file_path", "")).lower()
+        text_fields = [
+            finding.get("title", ""),
+            finding.get("description", ""),
+            finding.get("context", ""),
+            finding.get("summary", ""),
+            finding.get("matched_line", ""),
+            finding.get("code_snippet", ""),
+            finding.get("suggestion", ""),
+        ]
+        blob = " ".join(str(x).lower() for x in text_fields if x)
+        if not blob:
+            return False
+
+        # 必须是包含地址字面量的场景
+        has_address_literal = bool(re.search(r"0x[a-f0-9]{40}", blob, re.IGNORECASE))
+        if not has_address_literal:
+            return False
+
+        # 常见非敏感外部地址命名
+        has_external_identifier = any(
+            token in blob
+            for token in (
+                "permit2",
+                "token0",
+                "token1",
+                "weth",
+                "usdc",
+                "usdt",
+                "router",
+                "factory",
+                "quoter",
+            )
+        )
+        if not has_external_identifier:
+            return False
+
+        # 避免误抑制真实私钥/助记词泄露
+        has_real_secret_marker = any(
+            marker in blob
+            for marker in (
+                "private key",
+                "begin private key",
+                "mnemonic",
+                "seed phrase",
+                "keystore",
+                "私钥",
+                "助记词",
+            )
+        )
+        if has_real_secret_marker:
+            return False
+
+        # 优先抑制部署脚本与测试文件中的外部地址常量噪声
+        looks_like_script = (
+            file_path.endswith((".s.sol", ".ts", ".js", ".py"))
+            and ("script" in file_path or "deploy" in file_path or "test" in file_path)
+        )
+        looks_like_solidity_config = file_path.endswith(".sol")
+        return looks_like_script or looks_like_solidity_config
+
 
     
     def _parse_llm_response(self, response: str) -> AnalysisStep:
@@ -1167,10 +1245,19 @@ Final Answer:""",
             # 标准化发现
             logger.info(f"[{self.name}] Standardizing {len(all_findings)} findings")
             standardized_findings = []
+            suppressed_external_address_noise = 0
             for finding in all_findings:
                 # 确保 finding 是字典
                 if not isinstance(finding, dict):
                     logger.warning(f"Skipping invalid finding (not a dict): {finding}")
+                    continue
+
+                if self._should_suppress_external_address_noise(finding):
+                    suppressed_external_address_noise += 1
+                    logger.info(
+                        f"[{self.name}] Suppressed external-address noise finding: "
+                        f"{finding.get('title', 'N/A')} ({finding.get('file_path', '')})"
+                    )
                     continue
                     
                 standardized = {
@@ -1200,6 +1287,12 @@ Final Answer:""",
                     standardized["verification_priority"] = "mandatory_secondary"
 
                 standardized_findings.append(standardized)
+
+            if suppressed_external_address_noise > 0:
+                await self.emit_event(
+                    "info",
+                    f"🧹 已抑制 {suppressed_external_address_noise} 个硬编码外部地址噪声告警（Permit2/token0/token1 等）",
+                )
             
             await self.emit_event(
                 "info",

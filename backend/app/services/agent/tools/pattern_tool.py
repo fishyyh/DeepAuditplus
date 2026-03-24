@@ -325,7 +325,10 @@ class PatternMatchTool(AgentTool):
             "patterns": {
                 "_common": [
                     (r'(?:password|passwd|pwd)\s*=\s*["\'][^"\']{4,}["\']', "硬编码密码"),
-                    (r'(?:secret|api_?key|apikey|token|auth)\s*=\s*["\'][^"\']{8,}["\']', "硬编码密钥"),
+                    (
+                        r'(?:secret|api_?key|apikey|client_?secret|access_?token|bearer_?token|auth_?token|jwt_?secret)\s*=\s*["\'][^"\']{8,}["\']',
+                        "硬编码密钥",
+                    ),
                     (r'(?:private_?key|priv_?key)\s*=\s*["\'][^"\']+["\']', "硬编码私钥"),
                     (r'-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----', "私钥"),
                     (r'(?:aws_?access_?key|aws_?secret)\s*=\s*["\'][^"\']+["\']', "AWS密钥"),
