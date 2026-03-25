@@ -220,6 +220,7 @@ from .system_prompts import (
     VULNERABILITY_PRIORITIES,
     TOOL_USAGE_GUIDE,
     MULTI_AGENT_RULES,
+    SOLIDITY_BUSINESS_LOGIC_GUIDE,
     build_enhanced_prompt,
 )
 
@@ -239,6 +240,7 @@ __all__ = [
     "VULNERABILITY_PRIORITIES",
     "TOOL_USAGE_GUIDE",
     "MULTI_AGENT_RULES",
+    "SOLIDITY_BUSINESS_LOGIC_GUIDE",
     "build_enhanced_prompt",
 ]
 
