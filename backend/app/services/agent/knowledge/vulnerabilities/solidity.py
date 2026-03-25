@@ -1585,6 +1585,368 @@ function execute(..., bool isDelegateCall) external {
 )
 
 
+SOLIDITY_CALLBACK_SECURITY = KnowledgeDocument(
+    id="vuln_solidity_callback_security",
+    title="Solidity 不安全的外部合约回调（SC-025）",
+    category=KnowledgeCategory.VULNERABILITY,
+    tags=["solidity", "callback", "uniswap", "vrf", "erc777", "flash-loan", "msg-sender", "reentrancy"],
+    severity="high",
+    content="""
+# 不安全的外部合约回调
+
+## 概述
+外部协议在特定事件触发后会回调合约函数（Uniswap swap 回调、Chainlink VRF 随机数回调、
+Aave 闪电贷回调、ERC777 转账回调等）。若回调函数不校验调用来源，任意地址均可直接触发，
+造成资金被盗、状态被篡改或重入攻击。
+
+## 漏洞模式
+
+### 1. Uniswap V2 回调未验证 Pair 地址
+```solidity
+// ❌ 任意地址可直接调用 uniswapV2Call，模拟"已完成 swap"的场景
+function uniswapV2Call(
+    address sender, uint amount0, uint amount1, bytes calldata data
+) external {
+    // 没有校验 msg.sender 是合法的 Pair 合约！
+    _executeArbitrage(amount0, amount1, data);
+}
+```
+
+### 2. Chainlink VRF 回调未校验 Coordinator
+```solidity
+// ❌ 攻击者直接调用 fulfillRandomWords，传入自定义的"随机数"
+function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords)
+    internal override
+{
+    // 未校验 msg.sender == VRFCoordinator
+    winner = randomWords[0] % participants.length;
+    _sendPrize(winner);
+}
+// 继承 VRFConsumerBaseV2 时，基类已做校验；但自行实现时易遗漏
+```
+
+### 3. Aave 闪电贷回调未验证 Pool
+```solidity
+// ❌ 任意合约可调用 executeOperation，伪装成 Aave Pool
+function executeOperation(
+    address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params
+) external returns (bool) {
+    // 未校验 msg.sender == AAVE_POOL
+    IERC20(asset).approve(msg.sender, amount + premium);  // 批准任意合约
+    return true;
+}
+```
+
+### 4. ERC777 tokensReceived 触发重入
+```solidity
+// ❌ ERC777 transfer 会调用接收方的 tokensReceived，可触发重入
+contract Vault {
+    function withdraw(uint256 amount) external {
+        uint256 bal = balances[msg.sender];
+        require(bal >= amount);
+        erc777Token.transfer(msg.sender, amount);  // 触发 tokensReceived！
+        balances[msg.sender] -= amount;             // 状态在回调后更新，违反 CEI
+    }
+}
+```
+
+## 检测要点
+- `uniswapV2Call` / `pancakeCall` / `swapCallback` 是否有 `msg.sender == pair` 验证
+- `fulfillRandomWords` 是否继承了 `VRFConsumerBaseV2`（基类已有校验）
+- `executeOperation` / `onFlashLoan` 是否有 `msg.sender == POOL/LENDER` 验证
+- ERC777 相关函数是否遵守 CEI 或添加 `nonReentrant`
+- `onERC721Received` / `onERC1155Received` 内部是否有不安全的状态变更
+
+## 修复方案
+
+```solidity
+// ✅ Uniswap V2 回调：校验 Pair 地址由工厂合约创建
+function uniswapV2Call(address sender, uint amount0, uint amount1, bytes calldata data)
+    external override
+{
+    // 从 token0/token1 反推合法 Pair，不信任参数
+    address pair = IUniswapV2Factory(FACTORY).getPair(TOKEN_A, TOKEN_B);
+    require(msg.sender == pair, "Invalid pair");
+    require(sender == address(this), "Invalid initiator");
+    _executeArbitrage(amount0, amount1, data);
+}
+
+// ✅ Chainlink VRF：继承 VRFConsumerBaseV2（内置校验）
+contract MyLottery is VRFConsumerBaseV2 {
+    // fulfillRandomWords 由基类保护，只有 Coordinator 可调用
+    function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords)
+        internal override
+    {
+        winner = randomWords[0] % participants.length;
+    }
+}
+
+// ✅ Aave 闪电贷回调：严格校验来源
+function executeOperation(...) external returns (bool) {
+    require(msg.sender == AAVE_POOL, "Caller must be Aave Pool");
+    require(initiator == address(this), "Initiator must be this contract");
+    // 逻辑处理 ...
+    IERC20(asset).approve(msg.sender, amount + premium);
+    return true;
+}
+
+// ✅ ERC777：遵守 CEI，先更新状态再转账
+function withdraw(uint256 amount) external nonReentrant {
+    require(balances[msg.sender] >= amount);
+    balances[msg.sender] -= amount;        // Effects 先更新
+    erc777Token.transfer(msg.sender, amount);  // Interactions 后执行
+}
+```
+
+## 严重性
+**High** — 回调来源未校验时，攻击者可直接触发特权逻辑，绕过协议的业务约束，
+导致资金损失或状态被恶意篡改。
+""",
+)
+
+
+SOLIDITY_EVENT_LOGGING = KnowledgeDocument(
+    id="vuln_solidity_event_logging",
+    title="Solidity 关键操作缺少 Event 日志（SC-030）",
+    category=KnowledgeCategory.VULNERABILITY,
+    tags=["solidity", "event", "logging", "monitoring", "transparency", "indexed", "ownership"],
+    severity="medium",
+    content="""
+# 关键操作缺少 Event 日志
+
+## 概述
+智能合约的关键状态变更若不 emit 事件，链下监控、审计工具和用户均无法感知合约行为，
+导致攻击发生后无法及时响应，也无法追溯操作历史。Event 是合约透明度和可监控性的基础。
+
+## 漏洞模式
+
+### 1. 所有权/角色变更无事件
+```solidity
+// ❌ owner 静默转移，链下监控无法感知
+function transferOwnership(address newOwner) external onlyOwner {
+    owner = newOwner;  // 没有 emit OwnershipTransferred
+}
+
+// ❌ 角色授予无记录
+function grantRole(address account) external onlyAdmin {
+    roles[account] = true;  // 没有 emit RoleGranted
+}
+```
+
+### 2. 关键参数变更无事件
+```solidity
+// ❌ 费率被静默修改，用户不知情
+function setFee(uint256 newFee) external onlyOwner {
+    fee = newFee;  // 缺少 emit FeeUpdated(oldFee, newFee)
+}
+
+// ❌ 合约地址替换无警告
+function setOracle(address newOracle) external onlyOwner {
+    oracle = newOracle;  // 极其危险：替换为恶意预言机无任何告警
+}
+```
+
+### 3. 资产存取无日志
+```solidity
+// ❌ 大额提款无链上记录
+function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
+    IERC20(token).transfer(owner, amount);  // 缺少 emit EmergencyWithdraw
+}
+```
+
+### 4. 事件参数未使用 indexed
+```solidity
+// ❌ 无法按地址过滤事件，链下监控效率极低
+event Transfer(address from, address to, uint256 amount);
+// ✅ 应为
+event Transfer(address indexed from, address indexed to, uint256 amount);
+```
+
+## 检测要点
+- 所有权转移函数是否 emit `OwnershipTransferred(oldOwner, newOwner)`
+- 角色授予/撤销是否 emit `RoleGranted` / `RoleRevoked`
+- `setFee` / `setRate` / `setOracle` 等参数变更是否 emit（含 oldValue/newValue）
+- `pause` / `unpause` 是否 emit `Paused` / `Unpaused`
+- 资产存入/提出是否 emit `Deposit` / `Withdraw`
+- 关键地址参数（address 类型）是否使用 `indexed`
+
+## 修复方案
+
+```solidity
+// ✅ 标准事件定义
+event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+event FeeUpdated(uint256 oldFee, uint256 newFee);
+event OracleUpdated(address indexed oldOracle, address indexed newOracle);
+event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+event Paused(address account);
+event EmergencyWithdraw(address indexed token, address indexed to, uint256 amount);
+
+// ✅ 关键参数变更附带旧值
+function setFee(uint256 newFee) external onlyOwner {
+    require(newFee <= MAX_FEE, "Fee too high");
+    uint256 oldFee = fee;
+    fee = newFee;
+    emit FeeUpdated(oldFee, newFee);  // 包含变更前后的值
+}
+
+function setOracle(address newOracle) external onlyOwner {
+    require(newOracle != address(0), "Zero address");
+    emit OracleUpdated(oracle, newOracle);  // 先 emit，便于立即告警
+    oracle = newOracle;
+}
+
+// ✅ 所有权转移
+function transferOwnership(address newOwner) external onlyOwner {
+    emit OwnershipTransferred(owner, newOwner);
+    owner = newOwner;
+}
+```
+
+## 监控建议
+- 使用 OpenZeppelin Defender / Tenderly Alerts 订阅关键事件
+- 对 `setOracle`、`upgradeTo`、`transferOwnership` 事件设置即时告警（Slack/PagerDuty）
+- 建立合约状态快照，定期对比链上事件与预期状态
+
+## 严重性
+**Medium** — 缺少事件不直接导致资金损失，但使攻击行为无法被即时发现，
+显著增大事后响应难度和损失规模。
+""",
+)
+
+
+SOLIDITY_CROSS_CONTRACT_TRUST = KnowledgeDocument(
+    id="vuln_solidity_cross_contract_trust",
+    title="Solidity 跨合约调用与可信边界（SC-040）",
+    category=KnowledgeCategory.VULNERABILITY,
+    tags=["solidity", "cross-contract", "trust", "interface", "erc165", "circuit-breaker", "upgradeable", "oracle"],
+    severity="high",
+    content="""
+# 跨合约调用与可信边界
+
+## 概述
+协议之间高度组合（Composability）是 DeFi 的核心特性，也带来了严重的信任边界问题。
+合约盲目信任外部调用的返回值、依赖可升级合约的当前逻辑、允许管理员随意替换关键合约地址，
+都可能导致协议被恶意合约攻击或管理员作恶。
+
+## 漏洞模式
+
+### 1. 直接信任外部合约返回值
+```solidity
+// ❌ 直接使用外部预言机价格，不做合理性校验
+function getCollateralValue(address token, uint256 amount) public view returns (uint256) {
+    uint256 price = IOracle(oracle).getPrice(token);  // price 可能为 0 或异常值
+    return price * amount / 1e18;  // 若 price = 0，抵押品价值为 0，触发错误清算
+}
+```
+
+### 2. 未验证外部合约接口兼容性
+```solidity
+// ❌ 假设所有 token 都实现了标准 ERC20，直接调用 decimals()
+function normalize(address token, uint256 amount) public view returns (uint256) {
+    uint8 decimals = IERC20Metadata(token).decimals();  // 若 token 不实现此函数则 revert
+    return amount * 1e18 / 10**decimals;
+}
+```
+
+### 3. 外部合约地址可被管理员随意替换
+```solidity
+// ❌ owner 可随时将 oracle 替换为恶意合约，无任何延迟
+function setOracle(address newOracle) external onlyOwner {
+    oracle = newOracle;  // 替换为返回任意价格的合约
+}
+
+// ❌ 依赖可升级合约，升级后逻辑可能完全不同
+IRouter public router = IRouter(UNISWAP_ROUTER);  // Uniswap 若升级，行为可能改变
+```
+
+### 4. 缺少熔断器（Circuit Breaker）
+```solidity
+// ❌ 预言机持续返回异常价格，协议无自动暂停机制
+// 攻击期间损失持续扩大，直到 owner 手动暂停
+```
+
+### 5. 跨协议调用未考虑 Reentrancy
+```solidity
+// ❌ 调用外部 vault 的 deposit 后，vault 可能回调本合约
+function addLiquidity(uint256 amount) external {
+    token.transferFrom(msg.sender, address(this), amount);
+    IVault(vault).deposit(amount);   // vault 可能在 deposit 内回调
+    _updateLPBalance(msg.sender);    // 状态更新在外部调用后，违反 CEI
+}
+```
+
+## 检测要点
+- 外部调用返回的价格/余额是否做 `> 0` 和上下界校验
+- 是否通过 `ERC165.supportsInterface()` 验证外部合约接口
+- 关键合约地址（oracle/router/pool）变更是否有 Timelock + 多签保护
+- 是否有熔断器机制（价格偏差 > X% 自动 pause）
+- 跨协议调用后的状态更新是否遵守 CEI 原则
+
+## 修复方案
+
+```solidity
+// ✅ 外部价格返回值合理性校验
+function getCollateralValue(address token, uint256 amount) public view returns (uint256) {
+    uint256 price = IOracle(oracle).getPrice(token);
+    require(price > 0, "Invalid price: zero");
+    require(price < MAX_PRICE, "Invalid price: too high");
+    // 可选：对比 TWAP 价格，偏差过大则 revert
+    uint256 twap = _getTWAP(token);
+    require(price * 100 / twap >= 95 && price * 100 / twap <= 105, "Price deviation too large");
+    return price * amount / 1e18;
+}
+
+// ✅ ERC165 接口验证
+function setToken(address token) external onlyOwner {
+    require(
+        IERC165(token).supportsInterface(type(IERC20Metadata).interfaceId),
+        "Token does not support ERC20Metadata"
+    );
+    _token = token;
+}
+
+// ✅ 关键地址变更需 Timelock + 事件
+function proposeOracle(address newOracle) external onlyOwner {
+    require(newOracle != address(0));
+    pendingOracle = newOracle;
+    oracleChangeTime = block.timestamp + TIMELOCK_DELAY;  // 48h 延迟
+    emit OracleChangeProposed(oracle, newOracle, oracleChangeTime);
+}
+
+function executeOracleChange() external {
+    require(block.timestamp >= oracleChangeTime, "Timelock not expired");
+    emit OracleUpdated(oracle, pendingOracle);
+    oracle = pendingOracle;
+    pendingOracle = address(0);
+}
+
+// ✅ 熔断器（Circuit Breaker）
+modifier circuitBreaker() {
+    require(!paused, "Circuit breaker active");
+    _;
+}
+
+function _checkPriceDeviation(uint256 currentPrice) internal {
+    if (lastPrice > 0) {
+        uint256 deviation = currentPrice > lastPrice
+            ? (currentPrice - lastPrice) * 100 / lastPrice
+            : (lastPrice - currentPrice) * 100 / lastPrice;
+        if (deviation > MAX_PRICE_DEVIATION) {
+            paused = true;
+            emit CircuitBreakerTriggered(currentPrice, lastPrice);
+        }
+    }
+    lastPrice = currentPrice;
+}
+```
+
+## 严重性
+**High** — 外部合约可信边界失效可导致价格操控、清算被阻、任意参数篡改，
+与预言机操控结合可造成协议全额资产损失。
+""",
+)
+
+
 __all__ = [
     "SOLIDITY_REENTRANCY",
     "SOLIDITY_INTEGER_OVERFLOW",
@@ -1604,4 +1966,7 @@ __all__ = [
     "SOLIDITY_NFT_SECURITY",
     "SOLIDITY_STAKING_SECURITY",
     "SOLIDITY_MULTISIG_SECURITY",
+    "SOLIDITY_CALLBACK_SECURITY",
+    "SOLIDITY_EVENT_LOGGING",
+    "SOLIDITY_CROSS_CONTRACT_TRUST",
 ]

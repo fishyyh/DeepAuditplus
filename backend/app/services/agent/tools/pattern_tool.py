@@ -591,6 +591,43 @@ class PatternMatchTool(AgentTool):
             "description": "闪电贷回调风险：onFlashLoan 无来源校验（可被直接调用）、未验证还款金额、零手续费降低攻击成本",
         },
 
+        # 不安全的外部合约回调（SC-025）
+        "callback_security": {
+            "patterns": {
+                "solidity": [
+                    # Uniswap V2/V3 回调未校验 msg.sender == pair
+                    (r'function\s+uniswapV2Call\s*\([^)]*\)\s*(?:external|public)(?![^{]{0,200}require[^{]{0,100}msg\.sender)', "uniswapV2Call 疑似缺少 msg.sender == pair 校验（任意地址可直接调用）"),
+                    (r'function\s+(?:pancakeCall|swapCallback|uniswapV3SwapCallback|algebraSwapCallback)\s*\([^)]*\)\s*(?:external|public)(?![^{]{0,200}require[^{]{0,100}msg\.sender)', "swap 回调函数疑似缺少 msg.sender 来源验证"),
+                    # Chainlink VRF 回调未继承 VRFConsumerBase
+                    (r'function\s+fulfillRandomWords\s*\([^)]*\)\s*(?:external|public)(?!\s*\w*override)', "fulfillRandomWords 未用 override（应继承 VRFConsumerBaseV2 获得内置来源校验）"),
+                    # Aave/通用闪电贷回调未校验 Pool
+                    (r'function\s+executeOperation\s*\([^)]*\)\s*(?:external|public)(?![^{]{0,200}require[^{]{0,100}msg\.sender)', "executeOperation 疑似缺少 msg.sender == POOL 校验（Aave 闪电贷回调）"),
+                    # ERC721/1155 接收回调内做状态变更（重入风险）
+                    (r'function\s+onERC(?:721|1155)Received\s*\([^)]*\)\s*(?:external|public)[^{]*\{(?=[^}]{0,400}(?:balances|_balances|totalSupply|_mint|_burn|transfer))', "onERC721/1155Received 内含状态变更（回调重入风险，需 nonReentrant）"),
+                ],
+            },
+            "severity": "high",
+            "description": "不安全的外部回调：Uniswap/VRF/闪电贷回调未验证 msg.sender，可被任意地址直接触发",
+        },
+
+        # 关键操作缺少 Event 日志（SC-030）
+        "missing_events": {
+            "patterns": {
+                "solidity": [
+                    # 所有权转移无 emit
+                    (r'function\s+(?:transfer|renounce)Ownership\s*\([^)]*\)\s*(?:external|public)[^{]*\{(?![^}]{0,300}emit\s+Ownership)', "transferOwnership 疑似未 emit OwnershipTransferred 事件"),
+                    # 关键参数变更无 emit
+                    (r'function\s+set(?:Fee|Rate|Tax|Treasury|Oracle|Price|Limit|Cap|Threshold|Admin|Owner|Router|Pool|Vault)\w*\s*\([^)]*\)\s*(?:external|public)[^{]*\{(?![^}]{0,300}emit\s)', "关键参数变更函数疑似缺少 emit 事件"),
+                    # pause/unpause 无 emit
+                    (r'function\s+(?:pause|unpause)\s*\([^)]*\)\s*(?:external|public)[^{]*\{(?![^}]{0,200}emit\s)', "pause/unpause 函数疑似未 emit 对应事件"),
+                    # 关键 address 类型事件参数未使用 indexed
+                    (r'event\s+\w+\s*\([^)]*address\s+(?!indexed\s)\w+', "event 中 address 参数未使用 indexed（链下过滤效率低）"),
+                ],
+            },
+            "severity": "medium",
+            "description": "关键操作缺少 Event：所有权变更、参数修改、暂停操作未 emit 事件，导致链下监控盲区",
+        },
+
         # Timelock 与高权限操作（SC-022）
         "missing_timelock": {
             "patterns": {

@@ -533,6 +533,17 @@ stake()       → _balances[] → unstake() + getReward()
 ☐ 推荐：直接使用 Gnosis Safe 而非自实现
 ```
 
+#### ⚪ 通用合约安全（所有协议类型均需检查）
+```
+☐ 外部回调验证（SC-025）：uniswapV2Call/fulfillRandomWords/executeOperation 是否校验 msg.sender
+☐ ERC777/ERC721 回调重入：tokensReceived/onERC721Received 内状态变更是否遵守 CEI
+☐ 跨合约信任边界（SC-040）：外部价格/余额返回值是否做合理性校验（> 0，上下界）
+☐ 关键地址变更：oracle/router/pool 地址替换是否需要 Timelock + 多签
+☐ 熔断器：是否有价格偏差过大时自动 pause 的机制
+☐ Event 日志（SC-030）：所有权变更、参数修改、资产存取是否 emit 对应事件
+☐ indexed 参数：事件中 address/tokenId 等关键参数是否使用 indexed
+```
+
 ---
 
 ### Step 5：README vs 代码一致性核查

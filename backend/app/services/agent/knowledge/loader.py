@@ -208,6 +208,20 @@ class KnowledgeLoader:
             "lending": "solidity_lending_security",
             "liquidation": "solidity_lending_security",
             "health_factor": "solidity_lending_security",
+            # 回调/事件/跨合约
+            "callback": "solidity_callback_security",
+            "vrf": "solidity_callback_security",
+            "fulfillrandomwords": "solidity_callback_security",
+            "uniswapv2call": "solidity_callback_security",
+            "erc777": "solidity_callback_security",
+            "event": "solidity_event_logging",
+            "events": "solidity_event_logging",
+            "logging": "solidity_event_logging",
+            "emit": "solidity_event_logging",
+            "cross_contract": "solidity_cross_contract_trust",
+            "circuit_breaker": "solidity_cross_contract_trust",
+            "trust_boundary": "solidity_cross_contract_trust",
+            "external_call": "solidity_cross_contract_trust",
         }
         
         valid = []
