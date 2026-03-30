@@ -1027,7 +1027,7 @@ class BaseAgent(ABC):
             return min(default_max_chars, 2200)
         if name in high_context_tools:
             return min(default_max_chars, 3800)
-        if AgentBase._is_external_scanner_tool(name):
+        if BaseAgent._is_external_scanner_tool(name):
             return min(default_max_chars, 1800)
 
         # 默认收紧，减少中长观察结果占用的上下文
