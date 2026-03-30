@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from .base import BaseAgent, AgentConfig, AgentResult, AgentType, AgentPattern, TaskHandoff
 from ..json_parser import AgentJsonParser
-from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES, SOLIDITY_BUSINESS_LOGIC_GUIDE
+from ..prompts import CORE_SECURITY_PRINCIPLES, VULNERABILITY_PRIORITIES
 
 logger = logging.getLogger(__name__)
 
@@ -520,10 +520,314 @@ class AnalysisAgent(BaseAgent):
             if not points:
                 continue
             rel = os.path.relpath(path, self._safe_project_root(project_root))
-            bullet_text = "\n".join(f"- {point}" for point in points[:10])
+            bullet_text = "\n".join(
+                f"- {self._shorten_text(point, max_len=180)}"
+                for point in points[:10]
+            )
             sections.append(f"### 来源: {rel}\n{bullet_text}")
 
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _shorten_text(value: Any, max_len: int = 140) -> str:
+        text = str(value or "").strip()
+        if len(text) <= max_len:
+            return text
+        return text[:max_len].rstrip() + "..."
+
+    def _build_compact_recon_context(
+        self,
+        high_risk_areas: List[Any],
+        entry_points: List[Any],
+        initial_findings: List[Any],
+    ) -> str:
+        """将 Recon 上下文压缩为高信噪比摘要，避免 JSON 大块注入。"""
+        sections: List[str] = ["## 上下文信息（压缩摘要）"]
+
+        risk_lines: List[str] = []
+        seen_risks = set()
+        for item in high_risk_areas[:10]:
+            text = self._shorten_text(item, max_len=120)
+            if not text or text in seen_risks:
+                continue
+            seen_risks.add(text)
+            risk_lines.append(f"- {text}")
+        if risk_lines:
+            sections.append("### ⚠️ 高风险区域（优先读取）")
+            sections.extend(risk_lines)
+            sections.append("")
+
+        entry_lines: List[str] = []
+        for ep in entry_points[:8]:
+            if isinstance(ep, dict):
+                ep_type = self._shorten_text(ep.get("type", "entry"), max_len=28)
+                ep_file = self._shorten_text(ep.get("file", ep.get("file_path", "")), max_len=90)
+                ep_desc = self._shorten_text(ep.get("description", ""), max_len=90)
+                core = f"[{ep_type}] {ep_file}" if ep_file else f"[{ep_type}]"
+                if ep_desc:
+                    core += f" - {ep_desc}"
+                entry_lines.append(f"- {core}")
+            else:
+                text = self._shorten_text(ep, max_len=130)
+                if text:
+                    entry_lines.append(f"- {text}")
+        if entry_lines:
+            sections.append("### 入口点（摘要）")
+            sections.extend(entry_lines)
+            sections.append("")
+
+        finding_lines: List[str] = []
+        for f in initial_findings[:6]:
+            if isinstance(f, dict):
+                sev = self._shorten_text(f.get("severity", "unknown"), max_len=12).upper()
+                title = self._shorten_text(f.get("title", "潜在问题"), max_len=80)
+                path = self._shorten_text(f.get("file_path", ""), max_len=70)
+                if path:
+                    finding_lines.append(f"- [{sev}] {title} @ {path}")
+                else:
+                    finding_lines.append(f"- [{sev}] {title}")
+            else:
+                text = self._shorten_text(f, max_len=130)
+                if text:
+                    finding_lines.append(f"- {text}")
+        if finding_lines:
+            sections.append("### 初步发现（待验证）")
+            sections.extend(finding_lines)
+            sections.append("")
+
+        sections.append("请基于上述摘要优先做精准 read_file（小窗口）验证，不要一次读取过长代码。")
+        return "\n".join(sections).strip()
+
+    def _build_solidity_focus_guide(self, protocol_types: List[str]) -> str:
+        """
+        生成 Solidity 精简业务逻辑指南。
+        避免注入完整长指南，降低首轮上下文体积。
+        """
+        protocol_checklists: Dict[str, List[str]] = {
+            "DEX/AMM": [
+                "检查 reserve/price 是否可被闪贷同块操控（现货价风险）。",
+                "核对手续费与不变量（k 值）维护顺序，防止逻辑绕过。",
+                "确认 swap/add/remove 的滑点与最小输出保护是否有效。",
+                "检查外部回调路径是否存在重入窗口。",
+            ],
+            "借贷/Lending": [
+                "核对清算条件与健康因子计算边界（精度、四舍五入方向）。",
+                "检查价格源是否可操控（AMM 现货 vs TWAP/Oracle）。",
+                "确认清算/赎回流程不会被回调 revert 阻断。",
+                "检查借贷上限、利率模型和资金池耗尽路径。",
+            ],
+            "NFT": [
+                "核对 mint 总量、单地址限制、tokenId 唯一性。",
+                "检查 safeTransfer 回调是否引入重入状态错乱。",
+                "核对权限函数（mint/burn/setBaseURI）访问控制。",
+                "检查随机铸造/稀有度逻辑是否可预测或被抢跑。",
+            ],
+            "质押/Staking": [
+                "检查 rewardPerToken 累积逻辑和 totalSupply=0 分支。",
+                "检查奖励预算是否可被超发/重复发放。",
+                "核对 stake/unstake/getReward 是否受重入保护。",
+                "检查是否存在同块套利（stake->claim->unstake）。",
+            ],
+            "跨链/Bridge": [
+                "验证跨链消息来源与目标链身份校验是否严格。",
+                "检查 nonce/消息重放保护是否完整。",
+                "核对失败重试与补偿流程是否可被滥用。",
+                "检查跨链资产记账是否会双花或错账。",
+            ],
+            "治理/Governance": [
+                "核对投票权是否基于快照，而非实时余额。",
+                "检查 timelock、quorum、votingDelay 是否可绕过。",
+                "检查提案执行目标是否过宽（任意调用风险）。",
+                "核对管理员权限与紧急权限边界。",
+            ],
+            "代理合约/Proxy": [
+                "检查 initialize/upgrade 权限与可重入初始化风险。",
+                "核对存储布局升级兼容性（变量顺序/slot 冲突）。",
+                "检查 delegatecall 目标可控性与执行边界。",
+                "核对实现合约是否正确禁用再次初始化。",
+            ],
+            "多签/Multisig": [
+                "检查签名去重、阈值变更和 nonce 递增规则。",
+                "核对签名域是否含 chainId + 合约地址防重放。",
+                "检查执行目标白名单与 delegatecall 风险。",
+                "核对 owner 管理与紧急路径权限。",
+            ],
+        }
+
+        selected_types: List[str] = []
+        for p in protocol_types or []:
+            if p in protocol_checklists and p not in selected_types:
+                selected_types.append(p)
+            if len(selected_types) >= 3:
+                break
+
+        if not selected_types:
+            selected_types = ["DEX/AMM", "借贷/Lending"]
+
+        lines: List[str] = [
+            "## 🧭 Solidity 业务逻辑精简审计指南",
+            "- 先验证关键不变量，再看资金流与权限边界。",
+            "- 优先检查可直接导致资金损失的路径：重入、价格操控、权限绕过、升级滥用。",
+            "- 每个疑点必须用 read_file 小窗口复核后再下结论。",
+            "",
+        ]
+
+        for protocol in selected_types:
+            lines.append(f"### {protocol} 重点核查")
+            for item in protocol_checklists.get(protocol, [])[:4]:
+                lines.append(f"- {item}")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def _compact_handoff_context(self, handoff_context: str, max_chars: int = 4800) -> str:
+        """
+        压缩前序 Agent 交接上下文，避免原样注入导致首轮上下文膨胀。
+        """
+        text = (handoff_context or "").strip()
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return self._head_tail_compact(text, max_chars=max_chars)
+
+        head_lines = lines[:36]
+        tail_lines = lines[-14:] if len(lines) > 36 else []
+
+        markers = (
+            "critical",
+            "high",
+            "medium",
+            "漏洞",
+            "风险",
+            "建议",
+            "attention",
+            "priority",
+            "file",
+            "位置",
+            "action",
+            "summary",
+            "发现",
+            "关注",
+            "优先",
+        )
+
+        signal_lines: List[str] = []
+        for line in lines:
+            lower = line.lower()
+            if any(marker in lower for marker in markers):
+                signal_lines.append(line)
+            if len(signal_lines) >= 72:
+                break
+
+        merged: List[str] = []
+        seen = set()
+        for line in head_lines + signal_lines + tail_lines:
+            if line in seen:
+                continue
+            seen.add(line)
+            merged.append(line)
+
+        omitted_lines = max(0, len(lines) - len(merged))
+        compact = "\n".join(merged)
+        compact += (
+            f"\n\n...[交接上下文已压缩，省略 {omitted_lines} 行；"
+            "如需细节请按需 read_file/search_code 复核]..."
+        )
+
+        if len(compact) <= max_chars:
+            return compact
+        return self._head_tail_compact(compact, max_chars=max_chars)
+
+    def _compact_readme_context(self, readme_context: str, max_chars: int = 2600) -> str:
+        """
+        压缩 README 业务逻辑摘要，避免文档段落过长拖慢首轮推理。
+        """
+        text = (readme_context or "").strip()
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return self._head_tail_compact(text, max_chars=max_chars)
+
+        head_lines = lines[:28]
+        tail_lines = lines[-10:] if len(lines) > 28 else []
+        markers = (
+            "fee",
+            "oracle",
+            "liquid",
+            "upgrade",
+            "governance",
+            "mint",
+            "burn",
+            "withdraw",
+            "deposit",
+            "swap",
+            "权限",
+            "清算",
+            "预言机",
+            "费率",
+            "升级",
+            "治理",
+            "取款",
+            "存款",
+            "兑换",
+            "风险",
+            "机制",
+        )
+
+        signal_lines: List[str] = []
+        for line in lines:
+            lower = line.lower()
+            if any(marker in lower for marker in markers):
+                signal_lines.append(line)
+            if len(signal_lines) >= 40:
+                break
+
+        merged: List[str] = []
+        seen = set()
+        for line in head_lines + signal_lines + tail_lines:
+            if line in seen:
+                continue
+            seen.add(line)
+            merged.append(line)
+
+        omitted_lines = max(0, len(lines) - len(merged))
+        compact = "\n".join(merged)
+        compact += (
+            f"\n\n...[README 业务上下文已压缩，省略 {omitted_lines} 行；"
+            "必要时请分段 read_file README 原文]..."
+        )
+
+        if len(compact) <= max_chars:
+            return compact
+        return self._head_tail_compact(compact, max_chars=max_chars)
+
+    @staticmethod
+    def _apply_initial_message_budget(initial_message: str, max_chars: int = 14000) -> str:
+        """对首轮提示词做预算控制，防止首 token 超时。"""
+        if len(initial_message) <= max_chars:
+            return initial_message
+
+        compact = re.sub(r"\n{3,}", "\n\n", initial_message).strip()
+        if len(compact) <= max_chars:
+            return compact
+
+        head_len = int(max_chars * 0.72)
+        tail_len = max(1200, max_chars - head_len)
+        omitted = max(0, len(compact) - head_len - tail_len)
+
+        return (
+            f"{compact[:head_len]}\n\n"
+            f"...[系统已压缩初始上下文，省略 {omitted} 字符；如需细节请后续按 read_file 分段读取]...\n\n"
+            f"{compact[-tail_len:]}"
+        )
 
     @staticmethod
     def _is_readme_behavior_mismatch_finding(finding: Dict[str, Any]) -> bool:
@@ -886,6 +1190,16 @@ class AnalysisAgent(BaseAgent):
         solidity_readme_context = ""
         if is_solidity:
             solidity_readme_context = self._build_solidity_readme_context(project_root, target_files=target_files)
+            raw_readme_len = len(solidity_readme_context)
+            solidity_readme_context = self._compact_readme_context(solidity_readme_context, max_chars=2600)
+            if raw_readme_len and len(solidity_readme_context) < raw_readme_len:
+                await self.emit_event(
+                    "info",
+                    f"🧹 已压缩 README 业务上下文: {raw_readme_len} -> {len(solidity_readme_context)} 字符"
+                )
+                self.add_insight(
+                    f"README 业务上下文压缩 {raw_readme_len - len(solidity_readme_context)} 字符"
+                )
             if solidity_readme_context:
                 self.add_insight("已从 README 提取 Solidity 业务逻辑上下文，用于业务逻辑漏洞审计")
                 await self.emit_event("info", "📘 已自动读取 README，并提炼 Solidity 业务逻辑上下文")
@@ -921,34 +1235,39 @@ class AnalysisAgent(BaseAgent):
 请在下方业务逻辑分析指南的 Step 4 中，**优先**执行对应类型的专项清单。
 
 """
-            initial_message += f"""{SOLIDITY_BUSINESS_LOGIC_GUIDE}
-"""
+            initial_message += self._build_solidity_focus_guide(protocol_types) + "\n"
         # 🔥 如果指定了目标文件，明确告知 Agent
         if target_files:
             initial_message += f"""## ⚠️ 审计范围
 用户指定了 {len(target_files)} 个目标文件进行审计：
 """
-            for tf in target_files[:10]:
-                initial_message += f"- {tf}\n"
-            if len(target_files) > 10:
-                initial_message += f"- ... 还有 {len(target_files) - 10} 个文件\n"
+            for tf in target_files[:8]:
+                initial_message += f"- {self._shorten_text(tf, max_len=120)}\n"
+            if len(target_files) > 8:
+                initial_message += f"- ... 还有 {len(target_files) - 8} 个文件\n"
             initial_message += """
 请直接分析这些指定的文件，不要分析其他文件。
 
 """
         
-        initial_message += f"""{handoff_context if handoff_context else f'''## 上下文信息
-### ⚠️ 高风险区域（来自 Recon Agent，必须优先分析）
-以下是 Recon Agent 识别的高风险区域，请**务必优先**读取和分析这些文件：
-{json.dumps(high_risk_areas[:20], ensure_ascii=False)}
-
-**重要**: 请使用 read_file 工具读取上述高风险文件，不要假设文件路径或使用其他路径。
-
-### 入口点 (前10个)
-{json.dumps(entry_points[:10], ensure_ascii=False, indent=2)}
-
-### 初步发现 (如果有)
-{json.dumps(initial_findings[:5], ensure_ascii=False, indent=2) if initial_findings else "无"}'''}
+        if handoff_context:
+            raw_handoff_len = len(handoff_context)
+            compact_context = self._compact_handoff_context(handoff_context, max_chars=4800)
+            if len(compact_context) < raw_handoff_len:
+                await self.emit_event(
+                    "info",
+                    f"🧹 已压缩 Agent 交接上下文: {raw_handoff_len} -> {len(compact_context)} 字符"
+                )
+                self.add_insight(
+                    f"交接上下文压缩 {raw_handoff_len - len(compact_context)} 字符"
+                )
+        else:
+            compact_context = self._build_compact_recon_context(
+                high_risk_areas=high_risk_areas,
+                entry_points=entry_points,
+                initial_findings=initial_findings,
+            )
+        initial_message += f"""{compact_context}
 
 ## 任务
 {task_context or task or '进行全面的安全漏洞分析，发现代码中的安全问题。'}
@@ -967,6 +1286,15 @@ class AnalysisAgent(BaseAgent):
 {self.get_tools_description()}
 
 请开始你的安全分析。首先读取高风险区域的文件，然后**立即**分析其中的安全问题（输出 Action）。"""
+
+        raw_initial_len = len(initial_message)
+        initial_message = self._apply_initial_message_budget(initial_message, max_chars=14000)
+        if len(initial_message) < raw_initial_len:
+            await self.emit_event(
+                "info",
+                f"🧹 已压缩 Analysis 初始上下文: {raw_initial_len} -> {len(initial_message)} 字符"
+            )
+            self.add_insight(f"初始上下文压缩 {raw_initial_len - len(initial_message)} 字符，降低首轮超时风险")
         
         # 🔥 记录工作开始
         self.record_work("开始安全漏洞分析")
@@ -1054,6 +1382,14 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                 
                 # 重置空响应计数器
                 self._empty_retry_count = 0
+
+                # 检测超时错误输出，强制压缩上下文后重试
+                if llm_output.startswith("[超时错误:") or llm_output.startswith("[LLM调用错误:"):
+                    logger.warning(f"[{self.name}] LLM timeout/error detected, forcing context compression")
+                    self._conversation_history = self.compress_messages_if_needed(
+                        self._conversation_history, max_tokens=20000
+                    )
+                    continue
 
                 # 解析 LLM 响应
                 step = self._parse_llm_response(llm_output)
@@ -1177,7 +1513,10 @@ Final Answer: {{"findings": [...], "summary": "..."}}"""
                     # 添加观察结果到历史
                     self._conversation_history.append({
                         "role": "user",
-                        "content": self.format_observation_for_history(observation),
+                        "content": self.format_observation_for_history(
+                            observation,
+                            tool_name=step.action,
+                        ),
                     })
                     if rag_auth_failed:
                         self._conversation_history.append({

@@ -926,7 +926,7 @@ class BaseAgent(ABC):
     def compress_messages_if_needed(
         self,
         messages: List[Dict[str, str]],
-        max_tokens: int = 60000,
+        max_tokens: Optional[int] = None,
     ) -> List[Dict[str, str]]:
         """
         如果消息历史过长，自动压缩
@@ -939,7 +939,10 @@ class BaseAgent(ABC):
             压缩后的消息列表
         """
         from ...llm.memory_compressor import MemoryCompressor
-        
+        from app.core.config import settings as _settings
+
+        if max_tokens is None:
+            max_tokens = getattr(_settings, 'LLM_CONTEXT_WINDOW', 60000)
         compressor = MemoryCompressor(max_total_tokens=max_tokens)
         
         if compressor.should_compress(messages):
@@ -954,6 +957,7 @@ class BaseAgent(ABC):
         self,
         observation: str,
         max_chars: int = 4000,
+        tool_name: Optional[str] = None,
     ) -> str:
         """
         格式化 Observation，避免超长工具输出直接灌入上下文导致 token 暴涨。
@@ -961,6 +965,7 @@ class BaseAgent(ABC):
         Args:
             observation: 原始观察结果
             max_chars: 最大保留字符数
+            tool_name: 工具名称（用于按工具类型动态调整压缩策略）
 
         Returns:
             用于对话历史的 Observation 文本
@@ -969,21 +974,259 @@ class BaseAgent(ABC):
             return "Observation:\n[empty]"
 
         text = observation.strip()
-        if len(text) <= max_chars:
+        budget = self._get_observation_budget(tool_name, default_max_chars=max_chars)
+        if len(text) <= budget:
             return f"Observation:\n{text}"
 
-        # 保留头尾关键信息，中间截断，兼顾可读性与 token 成本
+        if (tool_name or "").lower() == "read_file":
+            compact = self._compact_read_file_observation(text, max_chars=budget)
+        elif self._is_external_scanner_tool(tool_name):
+            compact = self._compact_scanner_observation(text, max_chars=budget)
+        else:
+            compact = self._head_tail_compact(text, max_chars=budget)
+        return f"Observation:\n{compact}"
+
+    @staticmethod
+    def _is_external_scanner_tool(tool_name: Optional[str]) -> bool:
+        """判断是否是高噪声外部扫描工具。"""
+        if not tool_name:
+            return False
+
+        return tool_name.lower() in {
+            "semgrep_scan",
+            "bandit_scan",
+            "gitleaks_scan",
+            "trufflehog_scan",
+            "osv_scan",
+            "npm_audit",
+            "safety_scan",
+            "kunlun_scan",
+            "slither_scan",
+            "mythril_scan",
+        }
+
+    @staticmethod
+    def _get_observation_budget(tool_name: Optional[str], default_max_chars: int) -> int:
+        """
+        根据工具类型确定 observation 压缩预算。
+        外部扫描工具通常输出极长，压缩更激进；代码上下文工具保留更多。
+        """
+        name = (tool_name or "").lower()
+
+        high_context_tools = {
+            "search_code",
+            "rag_query",
+            "function_context",
+            "security_search",
+            "pattern_match",
+            "dataflow_analysis",
+        }
+
+        if name == "read_file":
+            # read_file 原始输出以代码行为主，过长会直接拖慢下轮推理
+            return min(default_max_chars, 2200)
+        if name in high_context_tools:
+            return min(default_max_chars, 3800)
+        if AgentBase._is_external_scanner_tool(name):
+            return min(default_max_chars, 1800)
+
+        # 默认收紧，减少中长观察结果占用的上下文
+        return min(default_max_chars, 2800)
+
+    @staticmethod
+    def _head_tail_compact(text: str, max_chars: int) -> str:
+        """保留头尾信息，中间截断。"""
         kept = max_chars
         head_len = int(kept * 0.75)
-        tail_len = max(200, kept - head_len)
+        tail_len = max(220, kept - head_len)
         omitted = max(0, len(text) - head_len - tail_len)
 
-        compact = (
+        return (
             f"{text[:head_len]}\n\n"
             f"...[已截断 {omitted} 字符，完整输出请查看工具结果日志]...\n\n"
             f"{text[-tail_len:]}"
         )
-        return f"Observation:\n{compact}"
+
+    def _compact_scanner_observation(self, text: str, max_chars: int) -> str:
+        """
+        对外部扫描结果做信号优先压缩，保留:
+        - 开头摘要
+        - 关键告警行（severity / cwe / file / line / error 等）
+        - 结尾统计
+        """
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return self._head_tail_compact(text, max_chars=max_chars)
+
+        header_lines = lines[:18]
+        tail_lines = lines[-10:] if len(lines) > 18 else []
+
+        markers = (
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "severity",
+            "cwe",
+            "owasp",
+            "vulnerability",
+            "漏洞",
+            "风险",
+            "error",
+            "failed",
+            "warning",
+            "file",
+            "path",
+            "line",
+            "rule",
+            "summary",
+            "total",
+            "发现",
+            "位置",
+            "建议",
+        )
+
+        signal_lines: List[str] = []
+        for line in lines:
+            lower = line.lower()
+            if any(marker in lower for marker in markers):
+                signal_lines.append(line)
+            if len(signal_lines) >= 48:
+                break
+
+        ordered: List[str] = []
+        seen: set = set()
+        for item in header_lines + signal_lines + tail_lines:
+            if item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+
+        compact = "\n".join(ordered)
+        omitted_lines = max(0, len(lines) - len(ordered))
+        compact_with_hint = (
+            f"{compact}\n\n...[已压缩，省略 {omitted_lines} 行原始输出，完整内容请查看工具结果日志]..."
+        )
+
+        if len(compact_with_hint) <= max_chars:
+            return compact_with_hint
+
+        return self._head_tail_compact(compact_with_hint, max_chars=max_chars)
+
+    def _compact_read_file_observation(self, text: str, max_chars: int) -> str:
+        """
+        针对 read_file 结果做结构化压缩，优先保留：
+        - 文件头信息（文件名、行范围）
+        - 代码块首尾
+        - 关键安全语义行
+        """
+        if "```" not in text:
+            return self._head_tail_compact(text, max_chars=max_chars)
+
+        parts = text.split("```")
+        if len(parts) < 3:
+            return self._head_tail_compact(text, max_chars=max_chars)
+
+        header = parts[0].strip()
+        code_raw = parts[1]
+        tail = parts[2].strip() if len(parts) > 2 else ""
+
+        if "\n" in code_raw:
+            lang, code_body = code_raw.split("\n", 1)
+        else:
+            lang, code_body = "text", code_raw
+
+        code_lines = code_body.splitlines()
+        if not code_lines:
+            return self._head_tail_compact(text, max_chars=max_chars)
+
+        if len(code_lines) <= 180:
+            # 行数不多时，避免过度压缩
+            return self._head_tail_compact(text, max_chars=max_chars)
+
+        keep_head = code_lines[:90]
+        keep_tail = code_lines[-50:]
+
+        signal_tokens = (
+            "reentrancy",
+            "delegatecall",
+            "tx.origin",
+            "selfdestruct",
+            "call{value",
+            "onlyowner",
+            "auth",
+            "permit",
+            "transferfrom",
+            "approve(",
+            "require(",
+            "assert(",
+            "unchecked",
+            "assembly",
+            "abi.decode",
+            "abi.encode",
+            "keccak256",
+            "ecrecover",
+            "balance",
+            "withdraw",
+            "mint",
+            "burn",
+            "oracle",
+            "liquidat",
+            "price",
+            "fee",
+            "slippage",
+            "swap",
+            "execute",
+            "call(",
+            "send(",
+            "transfer(",
+            "sql",
+            "query",
+            "exec(",
+            "eval(",
+            "request",
+            "deserialize",
+            "yaml.load",
+            "pickle",
+            "path",
+            "open(",
+        )
+
+        signal_lines: List[str] = []
+        for line in code_lines:
+            lower = line.lower()
+            if any(token in lower for token in signal_tokens):
+                signal_lines.append(line)
+            if len(signal_lines) >= 40:
+                break
+
+        selected: List[str] = []
+        seen = set()
+        for line in keep_head + signal_lines + keep_tail:
+            if line in seen:
+                continue
+            seen.add(line)
+            selected.append(line)
+
+        omitted = max(0, len(code_lines) - len(selected))
+        compact_code = "\n".join(selected)
+
+        compact_parts = []
+        if header:
+            compact_parts.append(header)
+        compact_parts.append(f"```{lang.strip() or 'text'}\n{compact_code}\n```")
+        if omitted > 0:
+            compact_parts.append(
+                f"...[read_file 代码已压缩，省略 {omitted} 行；请改用更小 start_line/end_line 继续读取]..."
+            )
+        if tail:
+            compact_parts.append(tail[:300])
+
+        compact = "\n\n".join(compact_parts)
+        if len(compact) <= max_chars:
+            return compact
+
+        return self._head_tail_compact(compact, max_chars=max_chars)
     
     # ============ 统一的流式 LLM 调用 ============
 
@@ -1024,111 +1267,133 @@ class BaseAgent(ABC):
         await self.emit_thinking_start()
         logger.info(f"[{self.name}] ✅ thinking_start emitted, starting LLM stream...")
 
-        try:
-            # 获取流式迭代器（传入 None 时使用用户配置）
-            stream = self.llm_service.chat_completion_stream(
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            # 兼容不同版本的 python async generator
-            iterator = stream.__aiter__()
+        import time
+        _max_retries = 2    # 首Token超时最多自动重试次数
+        _retry_delay = 3.0  # 重试前等待时间（秒）
 
-            import time
-            first_token_received = False
-            last_activity = time.time()
+        for _attempt in range(_max_retries + 1):
+            accumulated = ""
+            total_tokens = 0
+            _timed_out_before_first_token = False
 
-            while True:
-                # 检查取消
-                if self.is_cancelled:
-                    logger.info(f"[{self.name}] Cancelled during LLM streaming loop")
-                    break
-                
-                try:
-                    # 🔥 使用用户配置的超时时间
-                    # 第一个 token 使用首Token超时，后续 token 使用流式超时
-                    first_token_timeout = float(self._timeout_config.get('llm_first_token_timeout', 30))
-                    stream_timeout = float(self._timeout_config.get('llm_stream_timeout', 60))
-                    timeout = first_token_timeout if not first_token_received else stream_timeout
+            try:
+                # 获取流式迭代器（传入 None 时使用用户配置）
+                stream = self.llm_service.chat_completion_stream(
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                # 兼容不同版本的 python async generator
+                iterator = stream.__aiter__()
 
-                    chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+                first_token_received = False
+                last_activity = time.time()
 
-                    last_activity = time.time()
-                    
-                    if chunk["type"] == "token":
-                        first_token_received = True
-                        token = chunk["content"]
-                        # 🔥 累积 content，确保 accumulated 变量更新
-                        # 注意：某些 adapter 返回的 chunk["accumulated"] 可能已经包含了累积值，
-                        # 但为了安全起见，如果不一致，我们自己累积
-                        if "accumulated" in chunk:
-                            accumulated = chunk["accumulated"]
+                while True:
+                    # 检查取消
+                    if self.is_cancelled:
+                        logger.info(f"[{self.name}] Cancelled during LLM streaming loop")
+                        break
+
+                    try:
+                        # 🔥 使用用户配置的超时时间
+                        # 第一个 token 使用首Token超时，后续 token 使用流式超时
+                        first_token_timeout = float(self._timeout_config.get('llm_first_token_timeout', 30))
+                        stream_timeout = float(self._timeout_config.get('llm_stream_timeout', 60))
+                        timeout = first_token_timeout if not first_token_received else stream_timeout
+
+                        chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+
+                        last_activity = time.time()
+
+                        if chunk["type"] == "token":
+                            first_token_received = True
+                            token = chunk["content"]
+                            # 🔥 累积 content，确保 accumulated 变量更新
+                            # 注意：某些 adapter 返回的 chunk["accumulated"] 可能已经包含了累积值，
+                            # 但为了安全起见，如果不一致，我们自己累积
+                            if "accumulated" in chunk:
+                                accumulated = chunk["accumulated"]
+                            else:
+                                # 如果 adapter 没返回 accumulated，我们自己拼
+                                # 注意：如果是 token 类型，content 是增量
+                                # 如果 accumulated 被覆盖了，需要小心。
+                                # 实际上 service.py 中 chat_completion_stream 保证了 accumulated 存在
+                                # 这里我们信任 service 层的 accumulated
+                                pass
+
+                            # Double check if accumulated is empty but we have token
+                            if not accumulated and token:
+                                accumulated += token # Fallback
+
+                            await self.emit_thinking_token(token, accumulated)
+                            # 🔥 CRITICAL: 让出控制权给事件循环，让 SSE 有机会发送事件
+                            await asyncio.sleep(0)
+
+                        elif chunk["type"] == "done":
+                            accumulated = chunk["content"]
+                            if chunk.get("usage"):
+                                total_tokens = chunk["usage"].get("total_tokens", 0)
+                            break
+
+                        elif chunk["type"] == "error":
+                            accumulated = chunk.get("accumulated", "")
+                            error_msg = chunk.get("error", "Unknown error")
+                            error_type = chunk.get("error_type", "unknown")
+                            user_message = chunk.get("user_message", error_msg)
+                            logger.error(f"[{self.name}] Stream error ({error_type}): {error_msg}")
+
+                            if chunk.get("usage"):
+                                total_tokens = chunk["usage"].get("total_tokens", 0)
+
+                            # 使用特殊前缀标记 API 错误，让调用方能够识别
+                            # 格式：[API_ERROR:error_type] user_message
+                            if error_type in ("rate_limit", "quota_exceeded", "authentication", "connection"):
+                                accumulated = f"[API_ERROR:{error_type}] {user_message}"
+                            elif not accumulated:
+                                accumulated = f"[系统错误: {error_msg}] 请重新思考并输出你的决策。"
+                            break
+
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        timeout_type = "First Token" if not first_token_received else "Stream"
+                        logger.error(f"[{self.name}] LLM {timeout_type} Timeout ({timeout}s), attempt {_attempt + 1}/{_max_retries + 1}")
+                        if not first_token_received and _attempt < _max_retries:
+                            # 首Token超时且还有重试机会，标记后退出内循环进行重试
+                            _timed_out_before_first_token = True
                         else:
-                            # 如果 adapter 没返回 accumulated，我们自己拼
-                            # 注意：如果是 token 类型，content 是增量
-                            # 如果 accumulated 被覆盖了，需要小心。
-                            # 实际上 service.py 中 chat_completion_stream 保证了 accumulated 存在
-                            # 这里我们信任 service 层的 accumulated
-                            pass
-
-                        # Double check if accumulated is empty but we have token
-                        if not accumulated and token:
-                            accumulated += token # Fallback
-
-                        await self.emit_thinking_token(token, accumulated)
-                        # 🔥 CRITICAL: 让出控制权给事件循环，让 SSE 有机会发送事件
-                        await asyncio.sleep(0)
-
-                    elif chunk["type"] == "done":
-                        accumulated = chunk["content"]
-                        if chunk.get("usage"):
-                            total_tokens = chunk["usage"].get("total_tokens", 0)
+                            # 流中段超时或已用尽重试次数，返回错误
+                            error_msg = f"LLM 响应超时 ({timeout_type}, {timeout}s)"
+                            await self.emit_event("error", error_msg)
+                            if not accumulated:
+                                accumulated = f"[超时错误: {timeout}s 无响应] 请尝试简化请求或重试。"
                         break
 
-                    elif chunk["type"] == "error":
-                        accumulated = chunk.get("accumulated", "")
-                        error_msg = chunk.get("error", "Unknown error")
-                        error_type = chunk.get("error_type", "unknown")
-                        user_message = chunk.get("user_message", error_msg)
-                        logger.error(f"[{self.name}] Stream error ({error_type}): {error_msg}")
+            except asyncio.CancelledError:
+                logger.info(f"[{self.name}] LLM call cancelled")
+                await self.emit_thinking_end(accumulated)
+                raise
+            except Exception as e:
+                # 🔥 增强异常处理，避免吞掉错误
+                logger.error(f"[{self.name}] Unexpected error in stream_llm_call: {e}", exc_info=True)
+                await self.emit_event("error", f"LLM 调用错误: {str(e)}")
+                accumulated = f"[LLM调用错误: {str(e)}] 请重试。"
+                break  # 未知错误不重试
 
-                        if chunk.get("usage"):
-                            total_tokens = chunk["usage"].get("total_tokens", 0)
+            if _timed_out_before_first_token:
+                logger.info(f"[{self.name}] 首Token超时，{_retry_delay}s 后自动重试 (第 {_attempt + 1}/{_max_retries} 次重试)...")
+                await asyncio.sleep(_retry_delay)
+                continue  # 进入下一次重试
 
-                        # 使用特殊前缀标记 API 错误，让调用方能够识别
-                        # 格式：[API_ERROR:error_type] user_message
-                        if error_type in ("rate_limit", "quota_exceeded", "authentication", "connection"):
-                            accumulated = f"[API_ERROR:{error_type}] {user_message}"
-                        elif not accumulated:
-                            accumulated = f"[系统错误: {error_msg}] 请重新思考并输出你的决策。"
-                        break
+            break  # 流式调用成功或遇到不可重试的错误，退出重试循环
 
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
-                    timeout_type = "First Token" if not first_token_received else "Stream"
-                    logger.error(f"[{self.name}] LLM {timeout_type} Timeout ({timeout}s)")
-                    error_msg = f"LLM 响应超时 ({timeout_type}, {timeout}s)"
-                    await self.emit_event("error", error_msg)
-                    if not accumulated:
-                         accumulated = f"[超时错误: {timeout}s 无响应] 请尝试简化请求或重试。"
-                    break
-                    
-        except asyncio.CancelledError:
-            logger.info(f"[{self.name}] LLM call cancelled")
-            raise
-        except Exception as e:
-            # 🔥 增强异常处理，避免吞掉错误
-            logger.error(f"[{self.name}] Unexpected error in stream_llm_call: {e}", exc_info=True)
-            await self.emit_event("error", f"LLM 调用错误: {str(e)}")
-            accumulated = f"[LLM调用错误: {str(e)}] 请重试。"
-        finally:
-            await self.emit_thinking_end(accumulated)
-        
+        await self.emit_thinking_end(accumulated)
+
         # 🔥 记录空响应警告，帮助调试
         if not accumulated or not accumulated.strip():
             logger.warning(f"[{self.name}] Empty LLM response returned (total_tokens: {total_tokens})")
-        
+
         return accumulated, total_tokens
     
     async def execute_tool(self, tool_name: str, tool_input: Dict) -> str:
@@ -1290,6 +1555,47 @@ class BaseAgent(ABC):
         for name, tool in self.tools.items():
             if name.startswith("_"):
                 continue
-            desc = f"- {name}: {getattr(tool, 'description', 'No description')}"
+            summary = self._compact_tool_description(getattr(tool, "description", "No description"))
+            param_names = self._get_tool_param_names(tool, max_params=8)
+
+            desc = f"- {name}: {summary}"
+            if param_names:
+                desc += f" | 参数: {', '.join(param_names)}"
             tools_info.append(desc)
         return "\n".join(tools_info)
+
+    @staticmethod
+    def _compact_tool_description(description: str, max_len: int = 220) -> str:
+        """压缩工具描述，降低系统提示词 token 占用。"""
+        text = (description or "").strip()
+        if not text:
+            return "No description"
+
+        first_line = ""
+        for line in text.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                first_line = cleaned
+                break
+
+        compact = " ".join((first_line or text).split())
+        if len(compact) <= max_len:
+            return compact
+        return compact[:max_len].rstrip() + "..."
+
+    @staticmethod
+    def _get_tool_param_names(tool: Any, max_params: int = 8) -> List[str]:
+        """从 args_schema 提取参数名（兼容 Pydantic v1/v2）。"""
+        schema = getattr(tool, "args_schema", None)
+        if not schema:
+            return []
+
+        try:
+            fields = getattr(schema, "model_fields", None)  # Pydantic v2
+            if fields is None:
+                fields = getattr(schema, "__fields__", {})  # Pydantic v1
+            if not isinstance(fields, dict):
+                return []
+            return list(fields.keys())[:max_params]
+        except Exception:
+            return []

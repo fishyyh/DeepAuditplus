@@ -289,6 +289,14 @@ Action Input: {{"参数": "值"}}
                 # 重置空响应计数器
                 self._empty_retry_count = 0
 
+                # 检测超时错误，强制压缩上下文后重试
+                if llm_output.startswith("[超时错误:") or llm_output.startswith("[LLM调用错误:"):
+                    logger.warning(f"[{self.name}] LLM timeout/error detected, forcing context compression")
+                    self._conversation_history = self.compress_messages_if_needed(
+                        self._conversation_history, max_tokens=20000
+                    )
+                    continue
+
                 # 🔥 检查是否是 API 错误（而非格式错误）
                 if llm_output.startswith("[API_ERROR:"):
                     # 提取错误类型和消息

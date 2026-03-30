@@ -161,7 +161,7 @@ class CreateVulnerabilityReportTool(AgentTool):
             "command_injection", "code_injection", "path_traversal",
             "file_inclusion", "idor", "auth_bypass", "broken_auth",
             "sensitive_data_exposure", "hardcoded_secret", "weak_crypto",
-            "xxe", "deserialization", "race_condition", "business_logic",
+            "xxe", "deserialization", "race_condition", "reentrancy", "business_logic",
             "csrf", "open_redirect", "mass_assignment", "other"
         ]
         vulnerability_type = vulnerability_type.lower()

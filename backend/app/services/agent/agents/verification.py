@@ -764,7 +764,10 @@ class VerificationAgent(BaseAgent):
                         await self.emit_llm_observation(observation)
                         self._conversation_history.append({
                             "role": "user",
-                            "content": self.format_observation_for_history(observation),
+                            "content": self.format_observation_for_history(
+                                observation,
+                                tool_name=step.action,
+                            ),
                         })
                         continue
 
@@ -819,7 +822,10 @@ class VerificationAgent(BaseAgent):
                     # 添加观察结果到历史
                     self._conversation_history.append({
                         "role": "user",
-                        "content": self.format_observation_for_history(observation),
+                        "content": self.format_observation_for_history(
+                            observation,
+                            tool_name=step.action,
+                        ),
                     })
                 else:
                     # LLM 没有选择工具，提示它继续

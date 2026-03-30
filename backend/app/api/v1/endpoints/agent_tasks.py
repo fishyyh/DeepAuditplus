@@ -59,7 +59,7 @@ WEB_DEFAULT_VULNERABILITIES = [
 
 SOLIDITY_DEFAULT_VULNERABILITIES = [
     "auth_bypass",
-    "race_condition",
+    "reentrancy",
     "code_injection",
     "business_logic",
     "sensitive_data_exposure",
@@ -1311,6 +1311,7 @@ async def _save_findings(
         "weak_crypto": VulnerabilityType.WEAK_CRYPTO,
         "file_inclusion": VulnerabilityType.FILE_INCLUSION,
         "race_condition": VulnerabilityType.RACE_CONDITION,
+        "reentrancy": VulnerabilityType.RACE_CONDITION,
         "business_logic": VulnerabilityType.BUSINESS_LOGIC,
         "memory_corruption": VulnerabilityType.MEMORY_CORRUPTION,
     }
@@ -1962,7 +1963,11 @@ async def cancel_agent_task(
 
     # 🔥 0. 立即标记任务为已取消（用于前置操作的取消检查）
     _cancelled_tasks.add(task_id)
-    logger.info(f"[Cancel] Added task {task_id} to cancelled set")
+    import traceback as _tb
+    logger.warning(
+        f"[Cancel] Task {task_id} cancel triggered by user={current_user.id}\n"
+        f"Call stack:\n{''.join(_tb.format_stack())}"
+    )
 
     # 🔥 1. 设置 Agent 的取消标志
     runner = _running_tasks.get(task_id)

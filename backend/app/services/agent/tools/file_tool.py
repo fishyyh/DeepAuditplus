@@ -18,7 +18,7 @@ class FileReadInput(BaseModel):
     file_path: str = Field(description="文件路径（相对于项目根目录）")
     start_line: Optional[int] = Field(default=None, description="起始行号（从1开始）")
     end_line: Optional[int] = Field(default=None, description="结束行号")
-    max_lines: int = Field(default=500, description="最大返回行数")
+    max_lines: int = Field(default=240, ge=20, le=400, description="最大返回行数（建议 80-240）")
 
 
 class FileReadTool(AgentTool):
@@ -93,7 +93,7 @@ class FileReadTool(AgentTool):
 - file_path: 文件路径（相对于项目根目录）
 - start_line: 可选，起始行号
 - end_line: 可选，结束行号
-- max_lines: 最大返回行数（默认500）
+- max_lines: 最大返回行数（默认240，范围20-400）
 
 注意: 为避免输出过长，建议指定行范围或使用 RAG 搜索定位代码。"""
     
@@ -122,11 +122,30 @@ class FileReadTool(AgentTool):
         file_path: str,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
-        max_lines: int = 500,
+        max_lines: int = 240,
         **kwargs
     ) -> ToolResult:
         """执行文件读取"""
         try:
+            # 防止一次读取过长上下文导致后续 LLM 超时
+            max_lines = max(20, min(int(max_lines or 240), 400))
+            range_capped = False
+
+            if start_line is not None:
+                start_line = max(1, int(start_line))
+            if end_line is not None:
+                end_line = max(1, int(end_line))
+
+            if start_line is not None and end_line is not None:
+                if end_line < start_line:
+                    start_line, end_line = end_line, start_line
+                if end_line - start_line + 1 > max_lines:
+                    end_line = start_line + max_lines - 1
+                    range_capped = True
+            elif start_line is None and end_line is not None and end_line > max_lines:
+                end_line = max_lines
+                range_capped = True
+
             # 检查是否被排除
             if self._should_exclude(file_path):
                 return ToolResult(
@@ -221,6 +240,8 @@ class FileReadTool(AgentTool):
             
             if end_idx < total_lines:
                 output += f"\n\n... 还有 {total_lines - end_idx} 行未显示"
+            if range_capped:
+                output += f"\n\nℹ️ 已自动限制读取窗口为最多 {max_lines} 行，以避免上下文过长。"
             
             return ToolResult(
                 success=True,
@@ -688,4 +709,3 @@ class ListFilesTool(AgentTool):
                 success=False,
                 error=f"列出文件失败: {str(e)}",
             )
-

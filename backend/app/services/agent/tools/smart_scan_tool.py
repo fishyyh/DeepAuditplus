@@ -262,7 +262,7 @@ class SmartScanTool(AgentTool):
 
         focus_set = {v.lower() for v in focus_vulnerabilities}
         return bool(
-            {"business_logic", "auth_bypass", "race_condition", "code_injection"} & focus_set
+            {"business_logic", "auth_bypass", "race_condition", "reentrancy", "code_injection"} & focus_set
         )
 
     def _collect_solidity_context_files(self, target: str, max_files: int = 220) -> List[str]:
@@ -692,6 +692,7 @@ class SmartScanTool(AgentTool):
             "hardcoded_secret": "medium",
             "auth_bypass": "high",
             "race_condition": "critical",
+            "reentrancy": "critical",
             "code_injection": "high",
             "business_logic": "medium",
             "sensitive_data_exposure": "medium",
@@ -950,6 +951,7 @@ class QuickAuditTool(AgentTool):
             "weak_crypto": "使用 SHA-256 或更强的哈希算法。使用 AES-256-GCM 进行加密。",
             "auth_bypass": "避免使用 tx.origin 做权限校验，改用 msg.sender 并结合 OpenZeppelin Ownable/AccessControl。",
             "race_condition": "遵循 Checks-Effects-Interactions 模式并添加 ReentrancyGuard，避免在状态更新前进行外部调用。",
+            "reentrancy": "遵循 Checks-Effects-Interactions 模式并添加 ReentrancyGuard，避免在状态更新前进行外部调用。",
             "code_injection": "避免不受信任目标的 delegatecall/callcode；若必须使用，限定白名单并验证实现合约。",
             "business_logic": "不要将 block.timestamp/blockhash 用于关键随机性或经济安全逻辑，改用可验证随机源。",
             "sensitive_data_exposure": "不要在链上存储明文密钥、口令、私有业务秘密；private 不能防止链上读取。",
