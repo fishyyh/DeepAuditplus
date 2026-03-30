@@ -225,6 +225,10 @@ class OrchestratorAgent(BaseAgent):
         self._all_findings = []
         self._agent_results = {}  # 🔥 重置 Agent 结果缓存
         self._agent_handoffs = {}  # 🔥 重置 Agent handoff 缓存
+        # 🔥 重置跨次执行可能污染的重试计数器
+        self._format_retry_count = 0
+        self._empty_retry_count = 0
+        self._api_retry_count = 0
         final_result = None
         error_message = None  # 🔥 跟踪错误信息
         
@@ -351,21 +355,39 @@ Action Input: {{"参数": "值"}}
                 
                 if not step:
                     # LLM 输出格式不正确，提示重试
-                    format_retry_count = getattr(self, '_format_retry_count', 0) + 1
-                    self._format_retry_count = format_retry_count
-                    if format_retry_count >= 3:
+                    self._format_retry_count += 1
+                    logger.warning(
+                        f"[{self.name}] Format error #{self._format_retry_count}, "
+                        f"response[:300]={llm_output[:300]!r}"
+                    )
+                    if self._format_retry_count >= 5:
                         logger.error(f"[{self.name}] Too many format errors, stopping")
                         error_message = "连续格式错误，停止编排"
                         await self.emit_event("error", error_message)
                         break
-                    await self.emit_llm_decision("格式错误", "需要重新输出")
+                    await self.emit_llm_decision("格式错误", f"需要重新输出 ({self._format_retry_count}/5)")
                     self._conversation_history.append({
                         "role": "assistant",
                         "content": llm_output,
                     })
                     self._conversation_history.append({
                         "role": "user",
-                        "content": "请按照规定格式输出：Thought + Action + Action Input",
+                        "content": f"""你的输出格式不正确（第 {self._format_retry_count} 次）。必须严格按照以下格式输出，不能有任何前言或多余文字：
+
+Thought: [你的思考]
+Action: dispatch_agent
+Action Input: {{"agent": "recon", "task": "分析项目结构", "context": ""}}
+
+或者完成审计时：
+
+Thought: [你的思考]
+Action: finish
+Action Input: {{"conclusion": "审计结论", "findings": [], "recommendations": []}}
+
+可用的 Action 值：dispatch_agent、summarize、finish
+可调度的 Agent：{list(self.sub_agents.keys())}
+
+请现在立即按格式输出。""",
                     })
                     continue
                 
@@ -595,33 +617,52 @@ Action Input: {{"参数": "值"}}
         return msg
     
     def _parse_llm_response(self, response: str) -> Optional[AgentStep]:
-        """解析 LLM 响应"""
-        # 🔥 v2.1: 预处理 - 移除 Markdown 格式标记（LLM 有时会输出 **Action:** 而非 Action:）
-        cleaned_response = response
-        cleaned_response = re.sub(r'\*\*Action:\*\*', 'Action:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Action Input:\*\*', 'Action Input:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Thought:\*\*', 'Thought:', cleaned_response)
-        cleaned_response = re.sub(r'\*\*Observation:\*\*', 'Observation:', cleaned_response)
+        """解析 LLM 响应（兼容多种输出格式）"""
+        cleaned = response
 
-        # 提取 Thought
-        thought_match = re.search(r'Thought:\s*(.*?)(?=Action:|$)', cleaned_response, re.DOTALL)
+        # 预处理1：统一 Markdown 加粗标记 **Key:** → Key:
+        cleaned = re.sub(r'\*\*(Thought|Action Input|Action|Observation):\*\*', r'\1:', cleaned, flags=re.IGNORECASE)
+
+        # 预处理2：全角冒号 → 半角冒号
+        cleaned = cleaned.replace('：', ':')
+
+        # 预处理3：中文关键词映射（兼容部分模型输出中文）
+        cleaned = re.sub(r'(?m)^思考[:：]\s*', 'Thought: ', cleaned)
+        cleaned = re.sub(r'(?m)^行动[:：]\s*', 'Action: ', cleaned)
+        cleaned = re.sub(r'(?m)^操作[:：]\s*', 'Action: ', cleaned)
+        cleaned = re.sub(r'(?m)^操作输入[:：]\s*', 'Action Input: ', cleaned)
+        cleaned = re.sub(r'(?m)^行动输入[:：]\s*', 'Action Input: ', cleaned)
+
+        # 预处理4：去除 Action 值中的反引号
+        cleaned = re.sub(r'Action:\s*`(\w+)`', r'Action: \1', cleaned)
+
+        # 提取 Thought（大小写不敏感，允许缺失）
+        thought_match = re.search(
+            r'Thought:\s*(.*?)(?=Action\s*Input:|Action:|$)',
+            cleaned, re.DOTALL | re.IGNORECASE
+        )
         thought = thought_match.group(1).strip() if thought_match else ""
 
-        # 提取 Action
-        action_match = re.search(r'Action:\s*(\w+)', cleaned_response)
+        # 提取 Action（大小写不敏感，兼容 action_name 带下划线/连字符）
+        action_match = re.search(r'Action:\s*([\w\-]+)', cleaned, re.IGNORECASE)
         if not action_match:
+            logger.debug(f"[{self.name}] _parse_llm_response: no Action found. response[:200]={response[:200]!r}")
             return None
-        action = action_match.group(1).strip()
+        action = action_match.group(1).strip().lower()
 
-        # 提取 Action Input
-        input_match = re.search(r'Action Input:\s*(.*?)(?=Thought:|Observation:|$)', cleaned_response, re.DOTALL)
+        # 提取 Action Input（大小写不敏感）
+        input_match = re.search(
+            r'Action\s*Input:\s*(.*?)(?=Thought:|Observation:|$)',
+            cleaned, re.DOTALL | re.IGNORECASE
+        )
         if not input_match:
+            logger.debug(f"[{self.name}] _parse_llm_response: no Action Input found. response[:200]={response[:200]!r}")
             return None
 
         input_text = input_match.group(1).strip()
         # 移除 markdown 代码块
-        input_text = re.sub(r'```json\s*', '', input_text)
-        input_text = re.sub(r'```\s*', '', input_text)
+        input_text = re.sub(r'```(?:json)?\s*', '', input_text)
+        input_text = re.sub(r'```\s*', '', input_text).strip()
 
         # 使用增强的 JSON 解析器
         action_input = AgentJsonParser.parse(
